@@ -4,8 +4,8 @@ from datetime import datetime, timezone
 
 # ---------- CONFIG ----------
 APP_NAME   = "Console Arménienne"
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "armenie")
-SECRET_KEY = os.environ.get("SECRET_KEY", "change-me")
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "armenie")          # change-le plus tard dans Render > Environment
+SECRET_KEY = os.environ.get("SECRET_KEY", "change-me")        # clé secrète pour sessions
 DB_PATH    = "site.db"
 
 app = Flask(__name__)
@@ -24,7 +24,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT,
         body  TEXT,
-        status TEXT DEFAULT 'draft', -- 'draft'|'published'
+        status TEXT DEFAULT 'draft',  -- 'draft' | 'published'
         created_at TEXT,
         updated_at TEXT
       )
@@ -33,7 +33,6 @@ def init_db():
     con.close()
 
 def ensure_db():
-    """Sécurise: tente un SELECT, crée la table si besoin."""
     try:
         con = db()
         con.execute("SELECT 1 FROM posts LIMIT 1")
@@ -41,7 +40,7 @@ def ensure_db():
     except Exception:
         init_db()
 
-# crée la base dès le chargement du module ET avant la 1re requête
+# crée la base dès l'import ET avant la 1re requête (utile avec gunicorn)
 init_db()
 
 @app.before_first_request
@@ -227,7 +226,7 @@ def logout():
 def alias_console():
     return redirect(url_for("admin"))
 
-# ---------- DEV local ----------
+# ---------- LANCEMENT (debug ON) ----------
 if __name__ == "__main__":
     init_db()
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5000, debug=True)
