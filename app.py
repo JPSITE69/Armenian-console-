@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from urllib.parse import urljoin
 import requests, feedparser
 from bs4 import BeautifulSoup
-from PIL import Image, UnidentifiedImageError, ImageDraw, ImageFont
+from PIL import Image, UnidentifiedImageError
 
 # ================== CONFIG ==================
 APP_NAME   = "Console Arménienne"
@@ -35,7 +35,7 @@ def init_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       title TEXT,
       body  TEXT,
-      status TEXT DEFAULT 'draft',    -- draft | published
+      status TEXT DEFAULT 'draft',
       created_at TEXT,
       updated_at TEXT,
       image_url TEXT,
@@ -71,20 +71,22 @@ TAG_RE = re.compile(r"<[^>]+>")
 def strip_tags(s: str) -> str:
     return TAG_RE.sub("", s or "")
 
-def sanitize_filename(s: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_-]+", "-", (s or "").strip())[:40] or "img"
+def clean_title(t: str) -> str:
+    """Retire 'Titre:', 'Title:', guillemets, espaces; capitalise."""
+    t = strip_tags(t or "").strip()
+    t = re.sub(r'^(titre|title|headline)\s*[:\-–—]\s*', '', t, flags=re.I)
+    t = t.strip('«»"“”\'` ').strip()
+    if not t: t = "Actualité"
+    return t[:1].upper() + t[1:]
 
-def title_from_text(text: str) -> str:
-    t = (text or "").strip()
-    if not t: return "Actualité"
-    t = " ".join(t.split())[:120]
-    # première phrase ou ~12 mots
-    first = re.split(r"[.!?\n]", t)[0]
-    if len(first.split()) < 3:
-        first = " ".join(t.split()[:12])
-    return first[:1].upper() + first[1:]
+SIGN_REGEX = re.compile(r'(\s*[-–—]\s*Arménie\s+Info\s*)+$', re.I)
 
-# ================== HTTP & IMAGES ==================
+def ensure_signature(text: str) -> str:
+    """Supprime toutes les signatures existantes et en remet UNE propre à la fin."""
+    t = strip_tags(text or "").rstrip()
+    t = SIGN_REGEX.sub('', t).rstrip()
+    return (t + "\n\n- Arménie Info").strip()
+
 def http_get(url, timeout=20):
     r = requests.get(url, timeout=timeout, allow_redirects=True, headers={
         "User-Agent": "Mozilla/5.0 (+RenderBot)",
@@ -168,38 +170,6 @@ def download_image(url):
         print(f"[IMG] download failed for {url}: {e}")
         return None, None
 
-def create_placeholder_image(title: str):
-    W, H = 1200, 630
-    img = Image.new("RGB", (W, H), (24, 24, 24))
-    draw = ImageDraw.Draw(img)
-    text = (title or "Actualité").strip()
-    try:
-        font = ImageFont.truetype("arial.ttf", 48)
-    except Exception:
-        font = ImageFont.load_default()
-    words = text.split()
-    lines, line, max_w = [], "", int(W*0.85)
-    for w in words:
-        test = (line + " " + w).strip()
-        if draw.textlength(test, font=font) <= max_w:
-            line = test
-        else:
-            lines.append(line); line = w
-    if line: lines.append(line)
-    total_h = sum(font.size + 10 for _ in lines)
-    y = (H - total_h)//2
-    for ln in lines:
-        tw = draw.textlength(ln, font=font)
-        x = (W - tw)//2
-        draw.text((x, y), ln, fill=(240,240,240), font=font)
-        y += font.size + 10
-    os.makedirs("static/images", exist_ok=True)
-    name = sanitize_filename(text)
-    sha1 = hashlib.sha1(text.encode("utf-8")).hexdigest()
-    path = f"static/images/placeholder-{name}-{sha1[:8]}.jpg"
-    img.save(path, "JPEG", quality=88)
-    return "/"+path, sha1
-
 # ---- image par défaut (ta photo) ----
 def get_default_image():
     p = get_setting("default_image_path","").strip()
@@ -247,20 +217,21 @@ def html_from_entry(entry):
         if isinstance(entry.content, dict): return entry.content.get("value","")
     return entry.get("summary","") or entry.get("description","")
 
-# ================== OPENAI (toujours FR) ==================
+# ================== OPENAI (FR d’office) ==================
 def active_openai():
     key   = get_setting("openai_key", os.environ.get("OPENAI_API_KEY","")).strip()
     model = get_setting("openai_model", os.environ.get("OPENAI_MODEL", DEFAULT_MODEL)).strip() or DEFAULT_MODEL
     return key, model
 
 def rewrite_article_fr(title_src: str, raw_text: str):
-    """Toujours renvoyer FR. Si pas de clé/mauvaise réponse, petit texte FR neutre."""
+    """Toujours renvoyer FR. Nettoie le titre et signature unique."""
     key, model = active_openai()
     clean_input = strip_tags(raw_text or "")
     if not clean_input:
-        return (title_src or "Actualité", "(Contenu indisponible) - Arménie Info")
+        return clean_title(title_src or "Actualité"), ensure_signature("(Contenu indisponible)")
     if not key:
-        return (title_from_text(clean_input), "Traduction désactivée (ajoutez OPENAI_API_KEY). - Arménie Info")
+        return clean_title(title_src or "Actualité"), ensure_signature("Traduction désactivée (ajoutez OPENAI_API_KEY).")
+
     try:
         payload = {
             "model": model,
@@ -268,7 +239,8 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             "messages": [
                 {"role": "system", "content":
                  "Tu es un journaliste francophone. Réécris en FRANÇAIS : "
-                 "1) une première ligne = TITRE clair, 2) un corps concis (150–220 mots) qui se termine par '- Arménie Info'."},
+                 "1) une première ligne = un TITRE clair (sans le mot 'Titre'), "
+                 "2) un corps concis (150–220 mots). N’ajoute rien d’autre."},
                 {"role": "user", "content": f"Titre source: {title_src}\nTexte source: {clean_input}"}
             ]
         }
@@ -277,15 +249,15 @@ def rewrite_article_fr(title_src: str, raw_text: str):
                           json=payload, timeout=60)
         j = r.json()
         out = (j.get("choices") or [{}])[0].get("message", {}).get("content","").strip()
-        parts = out.split("\n", 1)
-        title = strip_tags(parts[0]).strip() or title_from_text(clean_input)
-        body  = strip_tags(parts[1] if len(parts)>1 else "").strip()
-        if not body.endswith("- Arménie Info"):
-            body += "\n\n- Arménie Info"
-        return title, body
+        # Découpage en (titre, corps)
+        lines = [l.strip() for l in out.splitlines() if l.strip()]
+        if not lines: raise RuntimeError("empty AI result")
+        ai_title = clean_title(lines[0])
+        ai_body  = ensure_signature("\n".join(lines[1:]) if len(lines)>1 else clean_input)
+        return ai_title, ai_body
     except Exception as e:
         print("[AI] fail:", e)
-        return (title_from_text(clean_input), "Erreur de traduction automatique. - Arménie Info")
+        return clean_title(title_src or "Actualité"), ensure_signature("Erreur de traduction automatique.")
 
 # ================== SCRAPE ==================
 def scrape_once(feeds):
@@ -296,13 +268,13 @@ def scrape_once(feeds):
         except Exception as e:
             print(f"[FEED] parse error {feed}: {e}")
             continue
-        for e in fp.entries[:50]:  # permissif
+        for e in fp.entries[:50]:
             try:
                 link = e.get("link") or ""
                 if not link:
                     skipped += 1; continue
 
-                # éviter juste les liens déjà importés
+                # éviter seulement les liens déjà importés
                 con = db()
                 try:
                     if con.execute("SELECT 1 FROM posts WHERE orig_link=?", (link,)).fetchone():
@@ -325,16 +297,13 @@ def scrape_once(feeds):
                 if not article_text:
                     article_text = "(Texte très bref.)"
 
-                # Image
+                # Image : trouvée ? sinon image par défaut si définie, sinon rien (PAS de placeholder noir)
                 img_url = get_image_from_entry(e, page_html=page_html, page_url=link) or None
                 local_path, sha1 = download_image(img_url) if img_url else (None, None)
                 if not local_path:
-                    # fallback -> ton image par défaut si définie
-                    def_p = get_setting("default_image_path","").strip()
+                    def_p, _ = get_default_image()
                     if def_p:
                         local_path = def_p
-                    else:
-                        local_path, sha1 = create_placeholder_image(title_src)
 
                 # FR d’office
                 title_fr, body_text = rewrite_article_fr(title_src, article_text)
@@ -586,10 +555,8 @@ def edit_image(post_id):
 def save(post_id):
     if not session.get("ok"): return redirect(url_for("admin"))
     action = request.form.get("action","save")
-    title  = strip_tags(request.form.get("title","").strip())
-    body   = strip_tags(request.form.get("body","").strip())
-    if body and not body.rstrip().endswith("- Arménie Info"):
-        body = body.rstrip() + "\n\n- Arménie Info"
+    title  = clean_title(request.form.get("title",""))
+    body   = ensure_signature(request.form.get("body",""))
     con = db()
     con.execute("UPDATE posts SET title=?, body=?, updated_at=? WHERE id=?",
                 (title, body, datetime.now(timezone.utc).isoformat(timespec="minutes"), post_id))
