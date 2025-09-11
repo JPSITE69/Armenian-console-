@@ -1,10 +1,14 @@
 from flask import Flask, request, redirect, url_for, Response, render_template_string, session, flash
 import sqlite3, os, hashlib, io, traceback, re, threading, time, json as _json
 from datetime import datetime, timezone
+from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 import feedparser
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, UnidentifiedImageError, ImageDraw, ImageFont
+from langdetect import detect, LangDetectException
+import pytz
+from difflib import SequenceMatcher
 
 # ================== CONFIG ==================
 APP_NAME   = "Console Arménienne"
@@ -12,16 +16,19 @@ ADMIN_PASS = os.environ.get("ADMIN_PASS", "armenie")
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me")
 DB_PATH    = "site.db"
 
-# Flux par défaut (tu peux les changer dans l’admin)
+# Flux par défaut (modifiable dans l’admin)
 DEFAULT_FEEDS = [
     "https://www.civilnet.am/news/feed/",
     "https://armenpress.am/rss/",
     "https://news.am/eng/rss/",
 ]
 
-# OpenAI via ENV (sera supplanté par les paramètres admin si renseignés)
+# OpenAI via ENV (remplaçable par Paramètres admin)
 ENV_OPENAI_KEY   = os.environ.get("OPENAI_API_KEY", "").strip()
 ENV_OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+
+# Heure locale de saisie dans l’admin (convertie en UTC)
+LOCAL_TZ_NAME = "Europe/Paris"
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -76,6 +83,53 @@ def set_setting(key, value):
     finally:
         con.close()
 
+# ================== UTILS ==================
+TAG_RE = re.compile(r"<[^>]+>")
+
+def strip_tags(s: str) -> str:
+    return TAG_RE.sub("", s or "")
+
+def looks_french(text: str) -> bool:
+    if not text or len(text) < 40:
+        return False
+    try:
+        return detect(text) == "fr"
+    except LangDetectException:
+        return False
+
+def sanitize_filename(s: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]+", "-", (s or "").strip())[:40] or "img"
+
+def _title_from_text_fallback(fr_text: str) -> str:
+    t = (fr_text or "").strip()
+    if not t:
+        return "Actualité"
+    words = t.split()
+    base = " ".join(words[:10]).strip().rstrip(".,;:!?")
+    base = base[:80]
+    return base[:1].upper() + base[1:]
+
+def looks_duplicate_title(con, title: str, threshold: float = 0.9) -> bool:
+    title = (title or "").lower().strip()
+    if not title: return False
+    rows = con.execute("SELECT title FROM posts ORDER BY id DESC LIMIT 200").fetchall()
+    for r in rows:
+        t = (r["title"] or "").lower().strip()
+        if t and SequenceMatcher(None, t, title).ratio() >= threshold:
+            return True
+    return False
+
+def local_to_utc_iso(local_dt_str: str, tz_name=LOCAL_TZ_NAME) -> str:
+    # local_dt_str: 'YYYY-MM-DDTHH:MM'
+    try:
+        naive = datetime.strptime(local_dt_str, "%Y-%m-%dT%H:%M")
+        tz = pytz.timezone(tz_name)
+        local_dt = tz.localize(naive)
+        utc_dt = local_dt.astimezone(pytz.UTC)
+        return utc_dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+    except Exception:
+        return ""
+
 # ================== HTTP & IMAGES ==================
 def http_get(url, timeout=20):
     r = requests.get(url, timeout=timeout, allow_redirects=True, headers={
@@ -87,18 +141,64 @@ def http_get(url, timeout=20):
     r.encoding = r.encoding or "utf-8"
     return r.text
 
-def find_main_image(html):
+def find_main_image_in_html(html, base_url=None):
     soup = BeautifulSoup(html, "html.parser")
+    # og:image / twitter:image
     for sel, attr in [("meta[property='og:image']", "content"),
                       ("meta[name='twitter:image']", "content")]:
         m = soup.select_one(sel)
-        if m and m.get(attr): return m[attr]
+        if m and m.get(attr):
+            return urljoin(base_url or "", m[attr])
+    # première image dans <article>
     a = soup.find("article")
     if a:
         imgtag = a.find("img")
-        if imgtag and imgtag.get("src"): return imgtag["src"]
+        if imgtag and imgtag.get("src"):
+            return urljoin(base_url or "", imgtag["src"])
+    # fallback: première image globale
     imgtag = soup.find("img")
-    return imgtag.get("src") if imgtag and imgtag.get("src") else None
+    if imgtag and imgtag.get("src"):
+        return urljoin(base_url or "", imgtag["src"])
+    return None
+
+def get_image_from_entry(entry, page_html=None, page_url=None):
+    # 1) champs RSS media/enclosure/links
+    try:
+        media = entry.get("media_content") or entry.get("media_thumbnail")
+        if isinstance(media, list) and media:
+            u = media[0].get("url")
+            if u: return urljoin(page_url or "", u)
+    except Exception:
+        pass
+    try:
+        enc = entry.get("enclosures") or entry.get("links")
+        if isinstance(enc, list):
+            for en in enc:
+                href = en.get("href") if isinstance(en, dict) else None
+                if href and any(href.lower().endswith(ext) for ext in (".jpg",".jpeg",".png",".webp",".gif")):
+                    return urljoin(page_url or "", href)
+    except Exception:
+        pass
+    # 2) img dans contenu RSS
+    for k in ("content","summary","description"):
+        v = entry.get(k)
+        if not v: continue
+        html = ""
+        if isinstance(v, list) and v:
+            html = v[0].get("value", "")
+        elif isinstance(v, dict):
+            html = v.get("value","")
+        elif isinstance(v, str):
+            html = v
+        if html:
+            s = BeautifulSoup(html, "html.parser")
+            imgtag = s.find("img")
+            if imgtag and imgtag.get("src"):
+                return urljoin(page_url or "", imgtag["src"])
+    # 3) page HTML
+    if page_html:
+        return find_main_image_in_html(page_html, base_url=page_url)
+    return None  # placeholder sera généré si besoin
 
 def download_image(url):
     if not url: return None, None
@@ -109,12 +209,9 @@ def download_image(url):
         sha1 = hashlib.sha1(data).hexdigest()
         try:
             im = Image.open(io.BytesIO(data))
-            im.verify()  # valide l’image
-        except UnidentifiedImageError:
-            print(f"[IMG] Unidentified image, skipping: {url}")
-            return None, None
-        except Exception as e:
-            print(f"[IMG] Pillow verification error: {e}")
+            im.verify()
+        except (UnidentifiedImageError, Exception) as e:
+            print(f"[IMG] verify fail {url}: {e}")
             return None, None
         os.makedirs("static/images", exist_ok=True)
         path = f"static/images/{sha1}.jpg"
@@ -124,6 +221,39 @@ def download_image(url):
     except Exception as e:
         print(f"[IMG] download failed for {url}: {e}")
         return None, None
+
+def create_placeholder_image(title: str):
+    W, H = 1200, 630
+    img = Image.new("RGB", (W, H), (24, 24, 24))
+    draw = ImageDraw.Draw(img)
+    text = (title or "Actualité").strip()
+    try:
+        font = ImageFont.truetype("arial.ttf", 48)
+    except Exception:
+        font = ImageFont.load_default()
+    # wrap simple
+    words = text.split()
+    lines, line, max_w = [], "", int(W*0.85)
+    for w in words:
+        test = (line + " " + w).strip()
+        if draw.textlength(test, font=font) <= max_w:
+            line = test
+        else:
+            lines.append(line); line = w
+    if line: lines.append(line)
+    total_h = sum(font.size + 10 for _ in lines)
+    y = (H - total_h)//2
+    for ln in lines:
+        tw = draw.textlength(ln, font=font)
+        x = (W - tw)//2
+        draw.text((x, y), ln, fill=(240,240,240), font=font)
+        y += font.size + 10
+    os.makedirs("static/images", exist_ok=True)
+    name = sanitize_filename(text)
+    sha1 = hashlib.sha1(text.encode("utf-8")).hexdigest()
+    path = f"static/images/placeholder-{name}-{sha1[:8]}.jpg"
+    img.save(path, "JPEG", quality=88)
+    return "/"+path, sha1
 
 # ================== EXTRACTION TEXTE ==================
 SEL_CANDIDATES = [
@@ -136,8 +266,7 @@ SEL_CANDIDATES = [
 
 def extract_article_text(html):
     soup = BeautifulSoup(html, "html.parser")
-    node_text = ""
-    best_len = 0
+    node_text, best_len = "", 0
     for sel in SEL_CANDIDATES:
         cand = soup.select_one(sel)
         if cand:
@@ -150,107 +279,99 @@ def extract_article_text(html):
         node_text = re.sub(r"\s+", " ", text).strip()
     return node_text[:5000] if node_text else ""
 
-# ================== RÉÉCRITURE FR (TITRE + TEXTE) ==================
-TAG_RE = re.compile(r"<[^>]+>")
-
-def strip_tags(s: str) -> str:
-    return TAG_RE.sub("", s or "")
-
-def active_openai():
-    key = get_setting("openai_key", ENV_OPENAI_KEY)
-    model = get_setting("openai_model", ENV_OPENAI_MODEL)
-    return (key.strip(), model.strip())
-
-def _title_from_text_fallback(fr_text: str) -> str:
-    """Titre FR court à partir du corps."""
-    t = (fr_text or "").strip()
-    if not t:
-        return "Actualité"
-    words = t.split()
-    base = " ".join(words[:10]).strip().rstrip(".,;:!?")
-    base = base[:80]
-    return base[:1].upper() + base[1:]
-
-def rewrite_article_fr(title_src: str, raw_text: str):
-    """
-    -> (title_fr, body_fr)
-    - supprime toutes balises en entrée/sortie
-    - corps en FR (150–220 mots), finit par " - Arménie Info"
-    - robuste si API OpenAI échoue
-    """
-    if not raw_text:
-        return (title_src or "Actualité", "")
-
-    key, model = active_openai()
-    clean_input = strip_tags(raw_text)
-
-    if key:
-        try:
-            prompt = (
-                "Tu es un journaliste francophone. "
-                "Traduis/réécris en FRANÇAIS le Titre et le Corps de l'article ci-dessous. "
-                "Ton neutre et factuel, 150–220 mots pour le corps. "
-                "RENVOIE STRICTEMENT du JSON avec les clés 'title' et 'body'. "
-                "Le 'body' doit être du TEXTE BRUT (PAS de balises HTML) et DOIT se terminer par: - Arménie Info.\n\n"
-                f"Titre (source): {title_src}\n"
-                f"Texte (source): {clean_input}"
-            )
-            payload = {
-                "model": model or "gpt-4o-mini",
-                "temperature": 0.2,
-                "messages": [
-                    {"role": "system", "content": "Tu écris en français clair et concis."},
-                    {"role": "user", "content": prompt}
-                ]
-            }
-            r = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json=payload, timeout=60
-            )
-            j = r.json()
-            out = (j.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
-
-            # tente de parser JSON, sinon fallback heuristique
-            try:
-                data = _json.loads(out)
-                title_fr = strip_tags(data.get("title", "")).strip()
-                body_fr  = strip_tags(data.get("body", "")).strip()
-            except Exception:
-                parts = out.split("\n", 1)
-                title_fr = strip_tags(parts[0]).strip()
-                body_fr  = strip_tags(parts[1] if len(parts) > 1 else "").strip()
-
-            if not body_fr:
-                body_fr = strip_tags(clean_input)
-                body_fr = " ".join(body_fr.split()[:200]).strip()
-
-            if not body_fr.endswith("- Arménie Info"):
-                body_fr += "\n\n- Arménie Info"
-
-            if not title_fr:
-                title_fr = _title_from_text_fallback(body_fr)
-
-            return (title_fr, body_fr)
-
-        except Exception as e:
-            print(f"[AI] rewrite_article_fr failed: {e}")
-
-    # ==== Fallback local (sans OpenAI) ====
-    fr_body = strip_tags(raw_text)
-    fr_body = " ".join(fr_body.split()[:200]).strip()
-    if not fr_body.endswith("- Arménie Info"):
-        fr_body += "\n\n- Arménie Info"
-    fr_title = _title_from_text_fallback(fr_body)
-    return (fr_title, fr_body)
-
 def html_from_entry(entry):
     if "content" in entry and entry.content:
         if isinstance(entry.content, list): return entry.content[0].get("value","")
         if isinstance(entry.content, dict): return entry.content.get("value","")
     return entry.get("summary","") or entry.get("description","")
 
-# ================== SCRAPE (SANS Google) ==================
+# ================== OPENAI / RÉÉCRITURE ==================
+def active_openai():
+    key = get_setting("openai_key", ENV_OPENAI_KEY)
+    model = get_setting("openai_model", ENV_OPENAI_MODEL)
+    return (key.strip(), model.strip())
+
+def rewrite_article_fr(title_src: str, raw_text: str):
+    """
+    -> (title_fr, body_fr, sure_fr)
+    Force le FR :
+      - 2 tentatives OpenAI si pas FR à la 1re
+      - fallback local + '(à traduire)' en brouillon
+    Corps: texte brut, finit par ' - Arménie Info'
+    """
+    if not raw_text:
+        return (title_src or "Actualité", "", False)
+
+    key, model = active_openai()
+    clean_input = strip_tags(raw_text)
+
+    def call_openai():
+        prompt = (
+            "Tu es un journaliste francophone. "
+            "Traduis/réécris en FRANÇAIS le Titre et le Corps de l'article ci-dessous. "
+            "Ton neutre et factuel, 150–220 mots pour le corps. "
+            "RENVOIE STRICTEMENT du JSON avec les clés 'title' et 'body'. "
+            "Le 'body' est du TEXTE BRUT (PAS de balises HTML) et DOIT se terminer par: - Arménie Info.\n\n"
+            f"Titre (source): {title_src}\n"
+            f"Texte (source): {clean_input}"
+        )
+        payload = {
+            "model": model or "gpt-4o-mini",
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": "Tu écris en français clair et concis. Réponds uniquement au format demandé."},
+                {"role": "user", "content": prompt}
+            ]
+        }
+        r = requests.post("https://api.openai.com/v1/chat/completions",
+                          headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                          json=payload, timeout=60)
+        j = r.json()
+        out = (j.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+        try:
+            data = _json.loads(out)
+            t = strip_tags(data.get("title","")).strip()
+            b = strip_tags(data.get("body","")).strip()
+        except Exception:
+            parts = out.split("\n", 1)
+            t = strip_tags(parts[0]).strip()
+            b = strip_tags(parts[1] if len(parts) > 1 else "").strip()
+        if not b:
+            b = strip_tags(clean_input)
+            b = " ".join(b.split()[:200]).strip()
+        if not b.endswith("- Arménie Info"):
+            b += "\n\n- Arménie Info"
+        if not t:
+            t = _title_from_text_fallback(b)
+        return t, b
+
+    if key:
+        try:
+            t1, b1 = call_openai()
+            if looks_french(b1) and looks_french(t1):
+                return (t1, b1, True)
+            print("[AI] Second attempt to enforce FR")
+            t2, b2 = call_openai()
+            if looks_french(b2) and looks_french(t2):
+                return (t2, b2, True)
+            # encore non FR
+            if not b2.endswith("- Arménie Info"):
+                b2 += "\n\n- Arménie Info"
+            b2 += "\n(à traduire)"
+            return (_title_from_text_fallback(b2), b2, False)
+        except Exception as e:
+            print(f"[AI] rewrite_article_fr failed: {e}")
+
+    # Fallback local (pas de vraie traduction)
+    fr_body = strip_tags(raw_text)
+    fr_body = " ".join(fr_body.split()[:200]).strip()
+    if not fr_body.endswith("- Arménie Info"):
+        fr_body += "\n\n- Arménie Info"
+    fr_body += "\n(à traduire)"
+    fr_title = _title_from_text_fallback(fr_body)
+    return (fr_title, fr_body, False)
+
+# ================== SCRAPE ==================
 def scrape_once(feeds):
     created, skipped = 0, 0
     for feed in feeds:
@@ -259,7 +380,7 @@ def scrape_once(feeds):
         except Exception as e:
             print(f"[FEED] parse error {feed}: {e}")
             continue
-        for e in fp.entries[:15]:
+        for e in fp.entries[:20]:
             try:
                 link = e.get("link") or ""
                 if not link:
@@ -287,9 +408,20 @@ def scrape_once(feeds):
                 if not article_text or len(article_text) < 120:
                     skipped += 1; continue
 
-                # image
-                img_url = find_main_image(page_html) if page_html else None
+                # image : RSS d'abord, puis page
+                img_url = get_image_from_entry(e, page_html=page_html, page_url=link) or None
                 local_path, sha1 = download_image(img_url) if img_url else (None, None)
+
+                # TITRE + TEXTE EN FR
+                title_fr, body_text, sure_fr = rewrite_article_fr(title_src, article_text)
+                if not body_text:
+                    skipped += 1; continue
+
+                # placeholder si pas d'image
+                if not local_path:
+                    local_path, sha1 = create_placeholder_image(title_fr)
+
+                # anti-doublon image
                 if sha1:
                     con = db()
                     try:
@@ -298,10 +430,14 @@ def scrape_once(feeds):
                     finally:
                         con.close()
 
-                # TITRE + TEXTE EN FR (robuste) —> texte pur, signé
-                title_fr, body_text = rewrite_article_fr(title_src, article_text)
-                if not body_text:
-                    skipped += 1; continue
+                # anti-doublon titre approchant
+                con = db()
+                try:
+                    if looks_duplicate_title(con, title_fr):
+                        skipped += 1; con.close(); continue
+                finally:
+                    try: con.close()
+                    except: pass
 
                 now = datetime.now(timezone.utc).isoformat()
                 con = db()
@@ -320,7 +456,7 @@ def scrape_once(feeds):
                 traceback.print_exc()
     return created, skipped
 
-# ================== SCHEDULER (publication auto) ==================
+# ================== SCHEDULERS ==================
 def publish_due_loop():
     while True:
         try:
@@ -343,6 +479,28 @@ def publish_due_loop():
         except Exception as e:
             print("[SCHED] loop error:", e)
         time.sleep(30)
+
+def import_auto_loop():
+    """Import automatique selon le paramètre 'import_every_minutes'."""
+    last_run = 0
+    while True:
+        try:
+            mins = int(get_setting("import_every_minutes", "0") or "0")
+            if mins > 0:
+                now = time.time()
+                if now - last_run >= mins * 60:
+                    feeds_txt = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
+                    feed_list = [u.strip() for u in feeds_txt.splitlines() if u.strip()]
+                    if feed_list:
+                        print(f"[AUTO-IMPORT] Running import (every {mins} min)")
+                        try:
+                            scrape_once(feed_list)
+                        except Exception as e:
+                            print("[AUTO-IMPORT] Error:", e)
+                    last_run = now
+        except Exception as e:
+            print("[AUTO-IMPORT] Loop error:", e)
+        time.sleep(60)
 
 # ================== UI ==================
 LAYOUT = """
@@ -390,7 +548,7 @@ def home():
     for r in rows:
         img = f"<img src='{r['image_url']}' alt='' style='max-width:100%;height:auto'>" if r["image_url"] else ""
         created = (r['created_at'] or '')[:16].replace('T',' ')
-        body_html = (r['body'] or '').replace("\n", "<br>")  # texte → HTML léger
+        body_html = (r['body'] or '').replace("\n", "<br>")
         cards.append(f"<article><header><h3>{r['title']}</h3><small>{created}</small></header>{img}<p>{body_html}</p></article>")
     return page("<h2>Dernières publications</h2>" + "".join(cards), "Publications")
 
@@ -427,6 +585,7 @@ def admin():
     feeds = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
     openai_key   = get_setting("openai_key", ENV_OPENAI_KEY)
     openai_model = get_setting("openai_model", ENV_OPENAI_MODEL)
+    import_minutes = int(get_setting("import_every_minutes", "0") or "0")
 
     con = db()
     try:
@@ -454,7 +613,7 @@ def admin():
               {state_btns}
               <button name="action" value="delete" class="contrast">🗑️ Supprimer</button>
             </div>
-            <label>Publier à (UTC)
+            <label>Publier à (HEURE LOCALE {LOCAL_TZ_NAME})
               <input type="datetime-local" name="publish_at" value="{pub_at}">
             </label>
             <div class="grid">
@@ -473,6 +632,11 @@ def admin():
           </label>
           <label>OpenAI Model
             <input name="openai_model" placeholder="gpt-4o-mini" value="{openai_model}">
+          </label>
+        </div>
+        <div class="grid">
+          <label>Import automatique (minutes, 0 = désactivé)
+            <input name="import_every_minutes" type="number" min="0" step="1" value="{import_minutes}">
           </label>
         </div>
         <label>Sources RSS (une URL par ligne)
@@ -497,11 +661,11 @@ def save_settings():
     if not session.get("ok"): return redirect(url_for("admin"))
     set_setting("openai_key", request.form.get("openai_key","").strip())
     set_setting("openai_model", request.form.get("openai_model","").strip())
+    set_setting("import_every_minutes", request.form.get("import_every_minutes","0").strip() or "0")
     set_setting("feeds", request.form.get("feeds",""))
     flash("Paramètres enregistrés.")
     return redirect(url_for("admin"))
 
-# --- Import via bouton (POST). Si quelqu’un tape l’URL en GET, on redirige.
 @app.post("/import-now")
 def import_now():
     if not session.get("ok"): return redirect(url_for("admin"))
@@ -529,10 +693,9 @@ def save(post_id):
     if not session.get("ok"): return redirect(url_for("admin"))
     action     = request.form.get("action","save")
     title      = strip_tags(request.form.get("title","").strip())
-    body       = strip_tags(request.form.get("body","").strip())  # texte pur
+    body       = strip_tags(request.form.get("body","").strip())
     publish_at = request.form.get("publish_at","").strip()
 
-    # s’assurer de la signature
     if body and not body.rstrip().endswith("- Arménie Info"):
         body = body.rstrip() + "\n\n- Arménie Info"
 
@@ -548,12 +711,14 @@ def save(post_id):
             flash("Dépublié.")
         elif action == "schedule":
             if not publish_at:
-                flash("Choisis une date/heure (UTC) pour planifier.")
+                flash(f"Choisis une date/heure ({LOCAL_TZ_NAME}) pour planifier.")
             else:
-                iso_utc = publish_at if len(publish_at) == 16 else publish_at[:16]
-                iso_utc += ":00+00:00" if len(iso_utc) == 16 else ""
-                con.execute("UPDATE posts SET status='scheduled', publish_at=? WHERE id=?", (iso_utc, post_id))
-                flash(f"Planifié pour {iso_utc} (UTC).")
+                iso_utc = local_to_utc_iso(publish_at, LOCAL_TZ_NAME)  # stocké en UTC
+                if not iso_utc:
+                    flash("Format de date/heure invalide.")
+                else:
+                    con.execute("UPDATE posts SET status='scheduled', publish_at=? WHERE id=?", (iso_utc, post_id))
+                    flash(f"Planifié pour {iso_utc} (UTC).")
         elif action == "delete":
             con.execute("DELETE FROM posts WHERE id=?", (post_id,))
             flash("Supprimé.")
@@ -575,7 +740,8 @@ def alias_console():
 # --------- boot ---------
 init_db()
 threading.Thread(target=publish_due_loop, daemon=True).start()
+threading.Thread(target=import_auto_loop, daemon=True).start()
 
 if __name__ == "__main__":
-    # En local seulement
+    # Dev local
     app.run(host="0.0.0.0", port=5000, debug=True)
