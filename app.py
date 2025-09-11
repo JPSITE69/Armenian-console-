@@ -1,5 +1,5 @@
 from flask import Flask, request, redirect, url_for, Response, render_template_string, session, flash
-import sqlite3, os, hashlib, io, traceback
+import sqlite3, os, hashlib, io, traceback, re, threading, time
 from datetime import datetime, timezone
 import requests
 from bs4 import BeautifulSoup
@@ -17,18 +17,22 @@ DEFAULT_FEEDS = [
     "https://news.am/eng/rss/",
 ]
 
-OPENAI_KEY   = os.environ.get("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+# Fallbacks (peuvent être remplacés par ce qui est stocké en base « settings »)
+ENV_OPENAI_KEY   = os.environ.get("OPENAI_API_KEY", "").strip()
+ENV_OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 
-# ------------ DB helpers ------------
+# ================== DB ==================
 def db():
-    # connexion par appel, thread-safe pour gunicorn gthread
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
+
+def column_exists(con, table, name):
+    rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r["name"] == name for r in rows)
 
 def init_db():
     con = db()
@@ -36,9 +40,10 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT,
         body  TEXT,
-        status TEXT DEFAULT 'draft',
+        status TEXT DEFAULT 'draft',         -- draft | scheduled | published
         created_at TEXT,
         updated_at TEXT,
+        publish_at TEXT,                     -- ISO UTC quand planifié
         image_url TEXT,
         image_sha1 TEXT,
         orig_link TEXT UNIQUE,
@@ -48,6 +53,9 @@ def init_db():
         key TEXT PRIMARY KEY,
         value TEXT
     )""")
+    # migrations douces
+    if not column_exists(con, "posts", "publish_at"):
+        con.execute("ALTER TABLE posts ADD COLUMN publish_at TEXT")
     con.commit(); con.close()
 
 def get_setting(key, default=""):
@@ -67,7 +75,7 @@ def set_setting(key, value):
     finally:
         con.close()
 
-# ------------ HTTP & images ------------
+# ================== HTTP & IMG ==================
 def http_get(url, timeout=20):
     r = requests.get(url, timeout=timeout, allow_redirects=True, headers={
         "User-Agent": "Mozilla/5.0 (+RenderBot)",
@@ -84,8 +92,12 @@ def find_main_image(html):
                       ("meta[name='twitter:image']", "content")]:
         m = soup.select_one(sel)
         if m and m.get(attr): return m[attr]
-    img = soup.find("img")
-    return img.get("src") if img and img.get("src") else None
+    a = soup.find("article")
+    if a:
+        imgtag = a.find("img")
+        if imgtag and imgtag.get("src"): return imgtag["src"]
+    imgtag = soup.find("img")
+    return imgtag.get("src") if imgtag and imgtag.get("src") else None
 
 def download_image(url):
     if not url: return None, None
@@ -96,16 +108,15 @@ def download_image(url):
         sha1 = hashlib.sha1(data).hexdigest()
         try:
             im = Image.open(io.BytesIO(data))
-            im.verify()  # valide le fichier
+            im.verify()
         except UnidentifiedImageError:
             print(f"[IMG] Unidentified image, skipping: {url}")
             return None, None
         except Exception as e:
             print(f"[IMG] Pillow verification error: {e}")
             return None, None
-        ext = "jpg"
         os.makedirs("static/images", exist_ok=True)
-        path = f"static/images/{sha1}.{ext}"
+        path = f"static/images/{sha1}.jpg"
         if not os.path.exists(path):
             with open(path, "wb") as f: f.write(data)
         return "/"+path, sha1
@@ -113,34 +124,73 @@ def download_image(url):
         print(f"[IMG] download failed for {url}: {e}")
         return None, None
 
-# ------------ Rewriting ------------
-def rewrite_html_fr(title, body_html):
-    # OpenAI optionnel
-    if OPENAI_KEY:
+# ================== EXTRACTION TEXTE ==================
+SEL_CANDIDATES = [
+    "article",
+    ".entry-content", ".post-content", ".td-post-content",
+    ".article-content", ".content-article", ".article-body",
+    "#article-body", "#content article", ".post__text", ".story-content",
+    ".single-content", ".content"
+]
+
+def extract_article_text(html):
+    soup = BeautifulSoup(html, "html.parser")
+    node_text = ""
+    best_len = 0
+    for sel in SEL_CANDIDATES:
+        cand = soup.select_one(sel)
+        if cand:
+            text = " ".join(p.get_text(" ", strip=True) for p in (cand.find_all(["p","h2","li"]) or [cand]))
+            text = re.sub(r"\s+", " ", text).strip()
+            if len(text) > best_len:
+                best_len = len(text); node_text = text
+    if not node_text:
+        text = " ".join(p.get_text(" ", strip=True) for p in soup.find_all("p"))
+        node_text = re.sub(r"\s+", " ", text).strip()
+    return node_text[:5000] if node_text else ""
+
+# ================== RÉÉCRITURE FR ==================
+def active_openai():
+    key = get_setting("openai_key", ENV_OPENAI_KEY)
+    model = get_setting("openai_model", ENV_OPENAI_MODEL)
+    return (key.strip(), model.strip())
+
+def rewrite_html_fr(title, raw_text):
+    """Retourne du HTML en <p>…</p> en FR. OpenAI si clé présente, sinon fallback."""
+    if not raw_text:
+        return ""
+    key, model = active_openai()
+    if key:
         try:
+            prompt = (
+                "Réécris en FRANÇAIS un article clair (150–220 mots) à partir du texte ci-dessous. "
+                "Ton neutre et factuel, pas d’emoji, pas d’invention. "
+                "Structure SEULEMENT avec des balises <p>…</p>.\n"
+                f"Titre: {title}\n\nTEXTE:\n{raw_text}"
+            )
             payload = {
-                "model": OPENAI_MODEL,
-                "temperature": 0.3,
+                "model": model or "gpt-4o-mini",
+                "temperature": 0.2,
                 "messages": [
-                    {"role":"system","content":
-                        "Tu es rédacteur francophone. Réécris clairement le contenu en 120–200 mots, "
-                        "structure en <p>, garde les faits, ton neutre."},
-                    {"role":"user","content": f"Titre: {title}\n\nHTML source:\n{body_html}"}
+                    {"role":"system","content":"Tu es un journaliste francophone sobre et précis."},
+                    {"role":"user","content": prompt}
                 ]
             }
             r = requests.post("https://api.openai.com/v1/chat/completions",
-                              headers={"Authorization": f"Bearer {OPENAI_KEY}",
+                              headers={"Authorization": f"Bearer {key}",
                                        "Content-Type":"application/json"},
                               json=payload, timeout=60)
             j = r.json()
             if j.get("choices"):
-                return j["choices"][0]["message"]["content"]
+                out = j["choices"][0]["message"]["content"].strip()
+                if "<p" not in out:
+                    out = f"<p>{out}</p>"
+                return out
         except Exception as e:
             print(f"[AI] rewrite failed: {e}")
-    # fallback local
-    txt = BeautifulSoup(body_html or "", "html.parser").get_text(" ")
-    words = txt.split()
-    return f"<p>{' '.join(words[:180])}</p>"
+    # Fallback local
+    words = raw_text.split()
+    return f"<p>{' '.join(words[:200])}</p>"
 
 def html_from_entry(entry):
     if "content" in entry and entry.content:
@@ -148,23 +198,20 @@ def html_from_entry(entry):
         if isinstance(entry.content, dict): return entry.content.get("value","")
     return entry.get("summary","") or entry.get("description","")
 
-# ------------ Scraper ------------
+# ================== SCRAPE ==================
 def scrape_once(feeds):
-    created = 0
-    skipped = 0
+    created, skipped = 0, 0
     for feed in feeds:
         try:
             fp = feedparser.parse(feed)
         except Exception as e:
             print(f"[FEED] parse error {feed}: {e}")
             continue
-
-        for e in fp.entries[:10]:
+        for e in fp.entries[:15]:
             try:
                 link = e.get("link") or ""
                 if not link:
                     skipped += 1; continue
-
                 # doublon par lien
                 con = db()
                 try:
@@ -174,18 +221,21 @@ def scrape_once(feeds):
                     con.close()
 
                 title = (e.get("title") or "(Sans titre)").strip()
-                html_src = html_from_entry(e)
-
-                img_url = None
+                # page
+                page_html = ""
                 try:
-                    page = http_get(link)
-                    img_url = find_main_image(page)
+                    page_html = http_get(link)
                 except Exception as ee:
                     print(f"[PAGE] fetch fail {link}: {ee}")
+                article_text = extract_article_text(page_html) if page_html else ""
+                if not article_text:
+                    article_text = BeautifulSoup(html_from_entry(e), "html.parser").get_text(" ", strip=True)
+                if not article_text or len(article_text) < 120:
+                    skipped += 1; continue
 
+                # image
+                img_url = find_main_image(page_html) if page_html else None
                 local_path, sha1 = download_image(img_url) if img_url else (None, None)
-
-                # doublon image
                 if sha1:
                     con = db()
                     try:
@@ -194,15 +244,18 @@ def scrape_once(feeds):
                     finally:
                         con.close()
 
-                html_final = rewrite_html_fr(title, html_src)
-                now = datetime.now(timezone.utc).isoformat()
+                # réécriture
+                html_final = rewrite_html_fr(title, article_text)
+                if not html_final:
+                    skipped += 1; continue
 
+                now = datetime.now(timezone.utc).isoformat()
                 con = db()
                 try:
                     con.execute("""INSERT INTO posts
-                      (title, body, status, created_at, updated_at, image_url, image_sha1, orig_link, source)
-                      VALUES(?,?,?,?,?,?,?,?,?)""",
-                      (title, html_final, "draft", now, now, local_path, sha1, link, fp.feed.get("title","")))
+                      (title, body, status, created_at, updated_at, publish_at, image_url, image_sha1, orig_link, source)
+                      VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                      (title, html_final, "draft", now, now, None, local_path, sha1, link, fp.feed.get("title","")))
                     con.commit()
                     created += 1
                 finally:
@@ -211,10 +264,34 @@ def scrape_once(feeds):
                 skipped += 1
                 print(f"[ENTRY] skipped due to error: {e}")
                 traceback.print_exc()
-                continue
     return created, skipped
 
-# ------------ UI ------------
+# ================== SCHEDULER (publication auto) ==================
+def publish_due_loop():
+    """Thread simple: toutes les 30 sec, publier les posts planifiés dont publish_at <= maintenant (UTC)."""
+    while True:
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            con = db()
+            try:
+                rows = con.execute(
+                    "SELECT id FROM posts WHERE status='scheduled' AND publish_at IS NOT NULL AND publish_at <= ?",
+                    (now,)).fetchall()
+                if rows:
+                    ids = [r["id"] for r in rows]
+                    con.execute(
+                        f"UPDATE posts SET status='published', updated_at=? WHERE id IN ({','.join('?'*len(ids))})",
+                        (now, *ids)
+                    )
+                    con.commit()
+                    print(f"[SCHED] Published IDs: {ids}")
+            finally:
+                con.close()
+        except Exception as e:
+            print("[SCHED] loop error:", e)
+        time.sleep(30)
+
+# ================== UI ==================
 LAYOUT = """
 <!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{{title}}</title>
@@ -294,15 +371,31 @@ def admin():
           <button>Entrer</button></form>""", "Connexion")
 
     feeds = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
+    openai_key   = get_setting("openai_key", ENV_OPENAI_KEY)
+    openai_model = get_setting("openai_model", ENV_OPENAI_MODEL)
+
     con = db()
     try:
         drafts = con.execute("SELECT * FROM posts WHERE status='draft' ORDER BY id DESC").fetchall()
+        scheduled = con.execute("SELECT * FROM posts WHERE status='scheduled' ORDER BY publish_at ASC").fetchall()
         pubs   = con.execute("SELECT * FROM posts WHERE status='published' ORDER BY id DESC").fetchall()
     finally:
         con.close()
 
-    def card(r, published=False):
+    def card(r, published=False, scheduled=False):
         img = f"<img src='{r['image_url']}' style='max-width:200px'>" if r["image_url"] else ""
+        pub_at = (r['publish_at'] or '')[:16]  # format pour <input type=datetime-local>
+        sched_block = f"""
+          <label>Publier à (UTC)
+            <input type="datetime-local" name="publish_at" value="{pub_at}">
+          </label>
+          <div class="grid">
+            <button name="action" value="schedule" class="secondary">🕒 Planifier</button>
+          </div>
+        """
+        state_btns = ("<button name='action' value='unpublish' class='secondary'>⏸️ Dépublier</button>"
+                      if published else
+                      "<button name='action' value='publish' class='secondary'>✅ Publier maintenant</button>")
         return f"""
         <details>
           <summary><b>{r['title'] or '(Sans titre)'}</b> — <small>{r['status']}</small></summary>
@@ -312,35 +405,50 @@ def admin():
             <label>Contenu<textarea name="body" rows="6">{r['body'] or ''}</textarea></label>
             <div class="grid">
               <button name="action" value="save">💾 Enregistrer</button>
-              {"<button name='action' value='unpublish' class='secondary'>⏸️ Dépublier</button>" if published else "<button name='action' value='publish' class='secondary'>✅ Publier</button>"}
+              {state_btns}
               <button name="action" value="delete" class="contrast">🗑️ Supprimer</button>
             </div>
+            {sched_block}
           </form>
         </details>"""
 
     body = f"""
-    <h3>Console</h3>
+    <h3>Paramètres</h3>
     <article>
-      <form method="post" action="{url_for('update_feeds')}">
-        <h4>Sources (une URL RSS par ligne)</h4>
-        <textarea name="feeds" rows="6">{feeds}</textarea>
-        <button>💾 Enregistrer les sources</button>
+      <form method="post" action="{url_for('save_settings')}">
+        <div class="grid">
+          <label>OpenAI API Key (priorité base)
+            <input type="password" name="openai_key" placeholder="sk-..." value="{openai_key}">
+          </label>
+          <label>OpenAI Model
+            <input name="openai_model" placeholder="gpt-4o-mini" value="{openai_model}">
+          </label>
+        </div>
+        <label>Sources RSS (une URL par ligne)
+          <textarea name="feeds" rows="6">{feeds}</textarea>
+        </label>
+        <button>💾 Enregistrer les paramètres</button>
       </form>
       <form method="post" action="{url_for('import_now')}" style="margin-top:1rem">
         <button>🔁 Importer maintenant (scraping + réécriture)</button>
       </form>
     </article>
+
     <h4>Brouillons</h4>{''.join(card(r) for r in drafts) or "<p>Aucun brouillon.</p>"}
+    <h4>Planifiés</h4>{''.join(card(r, scheduled=True) for r in scheduled) or "<p>Aucun article planifié.</p>"}
     <h4>Publiés</h4>{''.join(card(r, True) for r in pubs) or "<p>Rien de publié.</p>"}
     <p>Flux public : <code>{request.url_root}rss.xml</code></p>
     """
     return page(body, "Admin")
 
-@app.post("/update-feeds")
-def update_feeds():
+@app.post("/save-settings")
+def save_settings():
     if not session.get("ok"): return redirect(url_for("admin"))
+    set_setting("openai_key", request.form.get("openai_key","").strip())
+    set_setting("openai_model", request.form.get("openai_model","").strip())
     set_setting("feeds", request.form.get("feeds",""))
-    flash("Sources mises à jour."); return redirect(url_for("admin"))
+    flash("Paramètres enregistrés.")
+    return redirect(url_for("admin"))
 
 @app.post("/import-now")
 def import_now():
@@ -362,22 +470,33 @@ def save(post_id):
     action = request.form.get("action","save")
     title  = request.form.get("title","").strip()
     body   = request.form.get("body","").strip()
+    publish_at = request.form.get("publish_at","").strip()  # format 'YYYY-MM-DDTHH:MM' (on traite comme UTC)
+
     con = db()
     try:
-        if action == "delete":
+        # maj de base
+        con.execute("UPDATE posts SET title=?, body=?, updated_at=? WHERE id=?",
+                    (title, body, datetime.now(timezone.utc).isoformat(timespec="minutes"), post_id))
+        if action == "publish":
+            con.execute("UPDATE posts SET status='published', publish_at=NULL WHERE id=?", (post_id,))
+            flash("Publié immédiatement.")
+        elif action == "unpublish":
+            con.execute("UPDATE posts SET status='draft', publish_at=NULL WHERE id=?", (post_id,))
+            flash("Dépublié.")
+        elif action == "schedule":
+            if not publish_at:
+                flash("Choisis une date/heure (UTC) pour planifier.")
+            else:
+                # on interprète la saisie comme UTC
+                iso_utc = publish_at if len(publish_at) == 16 else publish_at[:16]
+                iso_utc += ":00+00:00" if len(iso_utc) == 16 else ""
+                con.execute("UPDATE posts SET status='scheduled', publish_at=? WHERE id=?", (iso_utc, post_id))
+                flash(f"Planifié pour {iso_utc} (UTC).")
+        elif action == "delete":
             con.execute("DELETE FROM posts WHERE id=?", (post_id,))
             flash("Supprimé.")
         else:
-            con.execute("UPDATE posts SET title=?, body=?, updated_at=? WHERE id=?",
-                        (title, body, datetime.now().isoformat(timespec="minutes"), post_id))
-            if action == "publish":
-                con.execute("UPDATE posts SET status='published' WHERE id=?", (post_id,))
-                flash("Publié.")
-            elif action == "unpublish":
-                con.execute("UPDATE posts SET status='draft' WHERE id=?", (post_id,))
-                flash("Dépublié.")
-            else:
-                flash("Enregistré.")
+            flash("Enregistré.")
         con.commit()
     finally:
         con.close()
@@ -393,6 +512,9 @@ def alias_console():
 
 # --------- boot ---------
 init_db()
+
+# lance le scheduler en arrière-plan
+threading.Thread(target=publish_due_loop, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
