@@ -17,7 +17,6 @@ DEFAULT_FEEDS = [
     "https://news.am/eng/rss/",
 ]
 
-# Fallbacks (peuvent être remplacés par ce qui est stocké en base « settings »)
 ENV_OPENAI_KEY   = os.environ.get("OPENAI_API_KEY", "").strip()
 ENV_OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
 
@@ -53,7 +52,6 @@ def init_db():
         key TEXT PRIMARY KEY,
         value TEXT
     )""")
-    # migrations douces
     if not column_exists(con, "posts", "publish_at"):
         con.execute("ALTER TABLE posts ADD COLUMN publish_at TEXT")
     con.commit(); con.close()
@@ -149,31 +147,37 @@ def extract_article_text(html):
         node_text = re.sub(r"\s+", " ", text).strip()
     return node_text[:5000] if node_text else ""
 
-# ================== RÉÉCRITURE FR ==================
+# ================== RÉÉCRITURE FR (TEXTE PUR + SIGNATURE) ==================
 def active_openai():
     key = get_setting("openai_key", ENV_OPENAI_KEY)
     model = get_setting("openai_model", ENV_OPENAI_MODEL)
     return (key.strip(), model.strip())
 
-def rewrite_html_fr(title, raw_text):
-    """Retourne du HTML en <p>…</p> en FR. OpenAI si clé présente, sinon fallback."""
+TAG_RE = re.compile(r"<[^>]+>")
+
+def strip_tags(s: str) -> str:
+    return TAG_RE.sub("", s or "")
+
+def rewrite_text_fr(title, raw_text):
+    """Retourne du TEXTE (sans balises) en FR, signé ' - Arménie Info'."""
     if not raw_text:
         return ""
     key, model = active_openai()
+    base_prompt = (
+        "Réécris en FRANÇAIS un article clair (150–220 mots) à partir du texte ci-dessous. "
+        "Ton neutre et factuel, pas d’emoji, pas d’invention. "
+        "RENVOIE UNIQUEMENT DU TEXTE BRUT (PAS DE BALISES). "
+        "Termine par: - Arménie Info\n"
+        f"Titre: {title}\n\nTEXTE:\n{raw_text}"
+    )
     if key:
         try:
-            prompt = (
-                "Réécris en FRANÇAIS un article clair (150–220 mots) à partir du texte ci-dessous. "
-                "Ton neutre et factuel, pas d’emoji, pas d’invention. "
-                "Structure SEULEMENT avec des balises <p>…</p>.\n"
-                f"Titre: {title}\n\nTEXTE:\n{raw_text}"
-            )
             payload = {
                 "model": model or "gpt-4o-mini",
                 "temperature": 0.2,
                 "messages": [
                     {"role":"system","content":"Tu es un journaliste francophone sobre et précis."},
-                    {"role":"user","content": prompt}
+                    {"role":"user","content": base_prompt}
                 ]
             }
             r = requests.post("https://api.openai.com/v1/chat/completions",
@@ -183,14 +187,19 @@ def rewrite_html_fr(title, raw_text):
             j = r.json()
             if j.get("choices"):
                 out = j["choices"][0]["message"]["content"].strip()
-                if "<p" not in out:
-                    out = f"<p>{out}</p>"
+                out = strip_tags(out)
+                if not out.endswith("- Arménie Info"):
+                    out += "\n\n- Arménie Info"
                 return out
         except Exception as e:
             print(f"[AI] rewrite failed: {e}")
-    # Fallback local
-    words = raw_text.split()
-    return f"<p>{' '.join(words[:200])}</p>"
+    # Fallback local (résumé simple + signature)
+    txt = strip_tags(raw_text)
+    words = txt.split()
+    out = " ".join(words[:200]).strip()
+    if not out.endswith("- Arménie Info"):
+        out += "\n\n- Arménie Info"
+    return out
 
 def html_from_entry(entry):
     if "content" in entry and entry.content:
@@ -244,9 +253,9 @@ def scrape_once(feeds):
                     finally:
                         con.close()
 
-                # réécriture
-                html_final = rewrite_html_fr(title, article_text)
-                if not html_final:
+                # réécriture en TEXTE + signature
+                body_text = rewrite_text_fr(title, article_text)
+                if not body_text:
                     skipped += 1; continue
 
                 now = datetime.now(timezone.utc).isoformat()
@@ -255,7 +264,7 @@ def scrape_once(feeds):
                     con.execute("""INSERT INTO posts
                       (title, body, status, created_at, updated_at, publish_at, image_url, image_sha1, orig_link, source)
                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                      (title, html_final, "draft", now, now, None, local_path, sha1, link, fp.feed.get("title","")))
+                      (title, body_text, "draft", now, now, None, local_path, sha1, link, fp.feed.get("title","")))
                     con.commit()
                     created += 1
                 finally:
@@ -268,7 +277,6 @@ def scrape_once(feeds):
 
 # ================== SCHEDULER (publication auto) ==================
 def publish_due_loop():
-    """Thread simple: toutes les 30 sec, publier les posts planifiés dont publish_at <= maintenant (UTC)."""
     while True:
         try:
             now = datetime.now(timezone.utc).isoformat()
@@ -337,7 +345,9 @@ def home():
     for r in rows:
         img = f"<img src='{r['image_url']}' alt='' style='max-width:100%;height:auto'>" if r["image_url"] else ""
         created = (r['created_at'] or '')[:16].replace('T',' ')
-        cards.append(f"<article><header><h3>{r['title']}</h3><small>{created}</small></header>{img}<p>{(r['body'] or '').replace(chr(10), '<br>')}</p></article>")
+        # body est du TEXTE → on remplace les sauts de ligne par <br>
+        body_html = (r['body'] or '').replace("\n", "<br>")
+        cards.append(f"<article><header><h3>{r['title']}</h3><small>{created}</small></header>{img}<p>{body_html}</p></article>")
     return page("<h2>Dernières publications</h2>" + "".join(cards), "Publications")
 
 @app.get("/rss.xml")
@@ -350,7 +360,7 @@ def rss_xml():
     items = []
     for r in rows:
         title = (r["title"] or "").replace("&","&amp;")
-        desc  = (BeautifulSoup(r["body"] or "", "html.parser").get_text(" ") or "").replace("&","&amp;")
+        desc  = (r["body"] or "").replace("&","&amp;")
         enclosure = f"<enclosure url='{request.url_root.rstrip('/') + r['image_url']}' type='image/jpeg'/>" if r["image_url"] else ""
         pub   = datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S %z')
         items.append(f"<item><title>{title}</title><link>{request.url_root}</link><guid isPermaLink='false'>{r['id']}</guid><description><![CDATA[{desc}]]></description>{enclosure}<pubDate>{pub}</pubDate></item>")
@@ -384,15 +394,7 @@ def admin():
 
     def card(r, published=False, scheduled=False):
         img = f"<img src='{r['image_url']}' style='max-width:200px'>" if r["image_url"] else ""
-        pub_at = (r['publish_at'] or '')[:16]  # format pour <input type=datetime-local>
-        sched_block = f"""
-          <label>Publier à (UTC)
-            <input type="datetime-local" name="publish_at" value="{pub_at}">
-          </label>
-          <div class="grid">
-            <button name="action" value="schedule" class="secondary">🕒 Planifier</button>
-          </div>
-        """
+        pub_at = (r['publish_at'] or '')[:16]
         state_btns = ("<button name='action' value='unpublish' class='secondary'>⏸️ Dépublier</button>"
                       if published else
                       "<button name='action' value='publish' class='secondary'>✅ Publier maintenant</button>")
@@ -408,7 +410,12 @@ def admin():
               {state_btns}
               <button name="action" value="delete" class="contrast">🗑️ Supprimer</button>
             </div>
-            {sched_block}
+            <label>Publier à (UTC)
+              <input type="datetime-local" name="publish_at" value="{pub_at}">
+            </label>
+            <div class="grid">
+              <button name="action" value="schedule" class="secondary">🕒 Planifier</button>
+            </div>
           </form>
         </details>"""
 
@@ -430,12 +437,12 @@ def admin():
         <button>💾 Enregistrer les paramètres</button>
       </form>
       <form method="post" action="{url_for('import_now')}" style="margin-top:1rem">
-        <button>🔁 Importer maintenant (scraping + réécriture)</button>
+        <button type="submit">🔁 Importer maintenant (scraping + réécriture)</button>
       </form>
     </article>
 
     <h4>Brouillons</h4>{''.join(card(r) for r in drafts) or "<p>Aucun brouillon.</p>"}
-    <h4>Planifiés</h4>{''.join(card(r, scheduled=True) for r in scheduled) or "<p>Aucun article planifié.</p>"}
+    <h4>Planifiés</h4>{''.join(card(r) for r in scheduled) or "<p>Aucun article planifié.</p>"}
     <h4>Publiés</h4>{''.join(card(r, True) for r in pubs) or "<p>Rien de publié.</p>"}
     <p>Flux public : <code>{request.url_root}rss.xml</code></p>
     """
@@ -450,6 +457,7 @@ def save_settings():
     flash("Paramètres enregistrés.")
     return redirect(url_for("admin"))
 
+# --- Import : POST normal + GET toléré (redirige proprement) ---
 @app.post("/import-now")
 def import_now():
     if not session.get("ok"): return redirect(url_for("admin"))
@@ -464,17 +472,27 @@ def import_now():
         flash(f"Erreur d’import : {e}")
     return redirect(url_for("admin"))
 
+@app.get("/import-now")
+def import_now_get():
+    # Si quelqu’un tape l’URL /import-now en GET → pas de 405,
+    # juste un retour à l’admin.
+    flash("Utilise le bouton « Importer maintenant » dans l’admin.")
+    return redirect(url_for("admin"))
+
 @app.post("/save/<int:post_id>")
 def save(post_id):
     if not session.get("ok"): return redirect(url_for("admin"))
     action = request.form.get("action","save")
     title  = request.form.get("title","").strip()
-    body   = request.form.get("body","").strip()
-    publish_at = request.form.get("publish_at","").strip()  # format 'YYYY-MM-DDTHH:MM' (on traite comme UTC)
+    body   = strip_tags(request.form.get("body","").strip())  # garantit texte pur si on édite à la main
+    publish_at = request.form.get("publish_at","").strip()
+
+    # s’assurer de la signature
+    if body and not body.rstrip().endswith("- Arménie Info"):
+        body = body.rstrip() + "\n\n- Arménie Info"
 
     con = db()
     try:
-        # maj de base
         con.execute("UPDATE posts SET title=?, body=?, updated_at=? WHERE id=?",
                     (title, body, datetime.now(timezone.utc).isoformat(timespec="minutes"), post_id))
         if action == "publish":
@@ -487,7 +505,6 @@ def save(post_id):
             if not publish_at:
                 flash("Choisis une date/heure (UTC) pour planifier.")
             else:
-                # on interprète la saisie comme UTC
                 iso_utc = publish_at if len(publish_at) == 16 else publish_at[:16]
                 iso_utc += ":00+00:00" if len(iso_utc) == 16 else ""
                 con.execute("UPDATE posts SET status='scheduled', publish_at=? WHERE id=?", (iso_utc, post_id))
@@ -512,8 +529,6 @@ def alias_console():
 
 # --------- boot ---------
 init_db()
-
-# lance le scheduler en arrière-plan
 threading.Thread(target=publish_due_loop, daemon=True).start()
 
 if __name__ == "__main__":
