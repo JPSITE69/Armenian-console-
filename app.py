@@ -1,10 +1,13 @@
 from flask import Flask, request, redirect, url_for, Response, render_template_string, session, flash
-import os, sqlite3, hashlib, io, re, traceback
+import os, sqlite3, hashlib, io, re, traceback, json
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 import requests, feedparser
 from bs4 import BeautifulSoup
 from PIL import Image, UnidentifiedImageError
+
+# Planification
+from apscheduler.schedulers.background import BackgroundScheduler
 
 # ================== CONFIG ==================
 APP_NAME   = "Console Arménienne"
@@ -19,6 +22,7 @@ DEFAULT_FEEDS = [
 ]
 
 DEFAULT_MODEL = "gpt-4o-mini"
+IMG_MIN_W, IMG_MIN_H = 200, 120  # rejeter les miniatures
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -38,6 +42,7 @@ def init_db():
       status TEXT DEFAULT 'draft',
       created_at TEXT,
       updated_at TEXT,
+      publish_at TEXT,
       image_url TEXT,
       image_sha1 TEXT,
       orig_link TEXT UNIQUE
@@ -72,7 +77,6 @@ def strip_tags(s: str) -> str:
     return TAG_RE.sub("", s or "")
 
 def clean_title(t: str) -> str:
-    """Retire 'Titre:', 'Title:', guillemets, espaces; capitalise."""
     t = strip_tags(t or "").strip()
     t = re.sub(r'^(titre|title|headline)\s*[:\-–—]\s*', '', t, flags=re.I)
     t = t.strip('«»"“”\'` ').strip()
@@ -82,12 +86,11 @@ def clean_title(t: str) -> str:
 SIGN_REGEX = re.compile(r'(\s*[-–—]\s*Arménie\s+Info\s*)+$', re.I)
 
 def ensure_signature(text: str) -> str:
-    """Supprime toutes les signatures existantes et en remet UNE propre à la fin."""
     t = strip_tags(text or "").rstrip()
     t = SIGN_REGEX.sub('', t).rstrip()
     return (t + "\n\n- Arménie Info").strip()
 
-def http_get(url, timeout=20):
+def http_get(url, timeout=25):
     r = requests.get(url, timeout=timeout, allow_redirects=True, headers={
         "User-Agent": "Mozilla/5.0 (+RenderBot)",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -97,62 +100,17 @@ def http_get(url, timeout=20):
     r.encoding = r.encoding or "utf-8"
     return r.text
 
-def find_main_image_in_html(html, base_url=None):
-    soup = BeautifulSoup(html, "html.parser")
-    for sel, attr in [("meta[property='og:image']", "content"),
-                      ("meta[name='twitter:image']", "content")]:
-        m = soup.select_one(sel)
-        if m and m.get(attr):
-            return urljoin(base_url or "", m[attr])
-    a = soup.find("article")
-    if a:
-        imgtag = a.find("img")
-        if imgtag and imgtag.get("src"):
-            return urljoin(base_url or "", imgtag["src"])
-    imgtag = soup.find("img")
-    if imgtag and imgtag.get("src"):
-        return urljoin(base_url or "", imgtag["src"])
-    return None
-
-def get_image_from_entry(entry, page_html=None, page_url=None):
-    try:
-        media = entry.get("media_content") or entry.get("media_thumbnail")
-        if isinstance(media, list) and media:
-            u = media[0].get("url")
-            if u: return urljoin(page_url or "", u)
-    except Exception:
-        pass
-    try:
-        enc = entry.get("enclosures") or entry.get("links")
-        if isinstance(enc, list):
-            for en in enc:
-                href = en.get("href") if isinstance(en, dict) else None
-                if href and any(href.lower().endswith(ext) for ext in (".jpg",".jpeg",".png",".webp",".gif")):
-                    return urljoin(page_url or "", href)
-    except Exception:
-        pass
-    for k in ("content","summary","description"):
-        v = entry.get(k)
-        html = ""
-        if isinstance(v, list) and v: html = v[0].get("value","")
-        elif isinstance(v, dict):     html = v.get("value","")
-        elif isinstance(v, str):      html = v
-        if html:
-            s = BeautifulSoup(html, "html.parser")
-            imgtag = s.find("img")
-            if imgtag and imgtag.get("src"):
-                return urljoin(page_url or "", imgtag["src"])
-    if page_html:
-        return find_main_image_in_html(page_html, base_url=page_url)
-    return None
-
+# --- Sauvegarde image locale + validation taille ---
 def _save_bytes_to_image(data: bytes):
     sha1 = hashlib.sha1(data).hexdigest()
     try:
         im = Image.open(io.BytesIO(data))
         im.verify()
-    except (UnidentifiedImageError, Exception) as e:
-        print(f"[IMG] verify fail: {e}")
+        im = Image.open(io.BytesIO(data))  # reopen to read size
+        w, h = im.size
+        if w < IMG_MIN_W or h < IMG_MIN_H:
+            return None, None
+    except (UnidentifiedImageError, Exception):
         return None, None
     os.makedirs("static/images", exist_ok=True)
     path = f"static/images/{sha1}.jpg"
@@ -163,11 +121,10 @@ def _save_bytes_to_image(data: bytes):
 def download_image(url):
     if not url: return None, None
     try:
-        r = requests.get(url, timeout=20)
+        r = requests.get(url, timeout=25)
         r.raise_for_status()
         return _save_bytes_to_image(r.content)
-    except Exception as e:
-        print(f"[IMG] download failed for {url}: {e}")
+    except Exception:
         return None, None
 
 # ---- image par défaut (ta photo) ----
@@ -189,6 +146,97 @@ def set_default_image_from_url(url: str):
         set_setting("default_image_path", p)
         set_setting("default_image_sha1", s)
     return p, s
+
+# ================== IMAGES — recherche agressive ==================
+def _extract_from_jsonld(soup, base):
+    for sc in soup.find_all("script", type=lambda v: v and "ld+json" in v):
+        try:
+            data = json.loads(sc.string or "{}")
+        except Exception:
+            continue
+        def pick(obj):
+            if isinstance(obj, str):
+                return urljoin(base, obj)
+            if isinstance(obj, list) and obj:
+                return pick(obj[0])
+            if isinstance(obj, dict):
+                return pick(obj.get("url") or obj.get("@id") or obj.get("contentUrl") or obj.get("thumbnailUrl"))
+            return None
+        cand = None
+        if isinstance(data, list):
+            for item in data:
+                cand = pick(item.get("image")) or pick(item.get("thumbnailUrl"))
+                if cand: return cand
+        if isinstance(data, dict):
+            cand = pick(data.get("image")) or pick(data.get("thumbnailUrl"))
+            if cand: return cand
+    return None
+
+def _extract_srcset(tag, base):
+    srcset = tag.get("srcset") or tag.get("data-srcset")
+    if not srcset: return None
+    best_url, best_w = None, -1
+    for part in srcset.split(","):
+        part = part.strip()
+        if not part: continue
+        bits = part.split()
+        u = urljoin(base, bits[0])
+        w = 0
+        if len(bits) > 1 and bits[1].endswith("w"):
+            try: w = int(bits[1][:-1])
+            except: w = 0
+        if w > best_w:
+            best_w, best_url = w, u
+    return best_url
+
+def image_candidates_from_html(html, base_url=None):
+    soup = BeautifulSoup(html, "html.parser")
+    cands = []
+
+    # OpenGraph / Twitter
+    for sel, attr in [
+        ("meta[property='og:image:secure_url']", "content"),
+        ("meta[property='og:image']", "content"),
+        ("meta[name='twitter:image']", "content"),
+        ("meta[itemprop='image']", "content"),
+        ("link[rel='image_src']", "href"),
+    ]:
+        for m in soup.select(sel):
+            if m.get(attr): cands.append(urljoin(base_url or "", m[attr]))
+
+    # JSON-LD (NewsArticle)
+    jld = _extract_from_jsonld(soup, base_url or "")
+    if jld: cands.append(jld)
+
+    # Article / figure
+    roots = soup.select("article, .entry-content, .post-content, .article-content, .content-article, .article-body, .single-content, .content")
+    if not roots: roots = [soup]
+    for root in roots:
+        for imgtag in root.find_all(["img","amp-img"]):
+            u = imgtag.get("src") or imgtag.get("data-src") or imgtag.get("data-original")
+            if not u:
+                u = _extract_srcset(imgtag, base_url or "")
+            if u:
+                u = urljoin(base_url or "", u)
+                # filtrer logos/icones sprites
+                low = u.lower()
+                if any(x in low for x in ["sprite", "icon", "logo", "placeholder", "blank"]):
+                    continue
+                cands.append(u)
+
+    # dédupliquer en gardant l'ordre
+    seen, uniq = set(), []
+    for u in cands:
+        if u not in seen:
+            seen.add(u); uniq.append(u)
+    return uniq
+
+def find_best_image(html, page_url):
+    for u in image_candidates_from_html(html, base_url=page_url):
+        p, s = download_image(u)
+        if p:  # validée par taille + Pillow
+            return p, s
+    return None, None
 
 # ================== EXTRACTION TEXTE ==================
 SEL_CANDIDATES = [
@@ -224,7 +272,6 @@ def active_openai():
     return key, model
 
 def rewrite_article_fr(title_src: str, raw_text: str):
-    """Toujours renvoyer FR. Nettoie le titre et signature unique."""
     key, model = active_openai()
     clean_input = strip_tags(raw_text or "")
     if not clean_input:
@@ -240,7 +287,7 @@ def rewrite_article_fr(title_src: str, raw_text: str):
                 {"role": "system", "content":
                  "Tu es un journaliste francophone. Réécris en FRANÇAIS : "
                  "1) une première ligne = un TITRE clair (sans le mot 'Titre'), "
-                 "2) un corps concis (150–220 mots). N’ajoute rien d’autre."},
+                 "2) un corps concis (150–220 mots), sans HTML. N’ajoute rien d’autre."},
                 {"role": "user", "content": f"Titre source: {title_src}\nTexte source: {clean_input}"}
             ]
         }
@@ -249,7 +296,6 @@ def rewrite_article_fr(title_src: str, raw_text: str):
                           json=payload, timeout=60)
         j = r.json()
         out = (j.get("choices") or [{}])[0].get("message", {}).get("content","").strip()
-        # Découpage en (titre, corps)
         lines = [l.strip() for l in out.splitlines() if l.strip()]
         if not lines: raise RuntimeError("empty AI result")
         ai_title = clean_title(lines[0])
@@ -259,22 +305,19 @@ def rewrite_article_fr(title_src: str, raw_text: str):
         print("[AI] fail:", e)
         return clean_title(title_src or "Actualité"), ensure_signature("Erreur de traduction automatique.")
 
-# ================== SCRAPE ==================
+# ================== SCRAPE (avec image forcée) ==================
 def scrape_once(feeds):
     created, skipped = 0, 0
     for feed in feeds:
-        try:
-            fp = feedparser.parse(feed)
+        try: fp = feedparser.parse(feed)
         except Exception as e:
-            print(f"[FEED] parse error {feed}: {e}")
-            continue
+            print(f"[FEED] parse error {feed}: {e}"); continue
+
         for e in fp.entries[:50]:
             try:
                 link = e.get("link") or ""
-                if not link:
-                    skipped += 1; continue
+                if not link: skipped += 1; continue
 
-                # éviter seulement les liens déjà importés
                 con = db()
                 try:
                     if con.execute("SELECT 1 FROM posts WHERE orig_link=?", (link,)).fetchone():
@@ -286,26 +329,29 @@ def scrape_once(feeds):
                 title_src = (e.get("title") or "(Sans titre)").strip()
 
                 page_html = ""
-                try:
-                    page_html = http_get(link)
+                try: page_html = http_get(link)
                 except Exception as ee:
                     print(f"[PAGE] fetch fail {link}: {ee}")
 
                 article_text = extract_article_text(page_html) if page_html else ""
                 if not article_text:
                     article_text = BeautifulSoup(html_from_entry(e), "html.parser").get_text(" ", strip=True)
-                if not article_text:
-                    article_text = "(Texte très bref.)"
+                if not article_text: article_text = "(Texte très bref.)"
 
-                # Image : trouvée ? sinon image par défaut si définie, sinon rien (PAS de placeholder noir)
-                img_url = get_image_from_entry(e, page_html=page_html, page_url=link) or None
-                local_path, sha1 = download_image(img_url) if img_url else (None, None)
+                # IMAGES : agressif -> si rien validé, essaye image par défaut; sinon rien
+                local_path = sha1 = None
+                if page_html:
+                    local_path, sha1 = find_best_image(page_html, link)
+                if not local_path:
+                    # Dernière tentative: candidats simples depuis l'entrée RSS
+                    media = e.get("media_content") or e.get("media_thumbnail") or []
+                    if isinstance(media, list) and media:
+                        local_path, sha1 = download_image(media[0].get("url"))
                 if not local_path:
                     def_p, _ = get_default_image()
-                    if def_p:
-                        local_path = def_p
+                    if def_p: local_path = def_p  # fallback à ta photo
 
-                # FR d’office
+                # FR d'office
                 title_fr, body_text = rewrite_article_fr(title_src, article_text)
 
                 now = datetime.now(timezone.utc).isoformat()
@@ -315,8 +361,7 @@ def scrape_once(feeds):
                       (title, body, status, created_at, updated_at, image_url, image_sha1, orig_link)
                       VALUES(?,?,?,?,?,?,?,?)""",
                       (title_fr, body_text, "draft", now, now, local_path, sha1, link))
-                    con.commit()
-                    created += 1
+                    con.commit(); created += 1
                 finally:
                     con.close()
             except Exception as e:
@@ -368,7 +413,7 @@ def home():
         return page("<h2>Dernières publications</h2><p>Aucune publication.</p>", "Publications")
     cards = []
     for r in rows:
-        img = f"<img src='{r['image_url']}' alt='' style='max-width:100%;height:auto'>" if r["image_url"] else ""
+        img = f"<img src='{r['image_url']}' alt='' style='max-width:100%;height:auto;margin:.5rem 0'>" if r["image_url"] else ""
         created = (r['created_at'] or '')[:16].replace('T',' ')
         body_html = (r['body'] or '').replace("\n","<br>")
         cards.append(f"<article><header><h3>{r['title']}</h3><small>{created}</small></header>{img}<p>{body_html}</p></article>")
@@ -406,6 +451,7 @@ def admin():
     feeds = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
     openai_key   = get_setting("openai_key", os.environ.get("OPENAI_API_KEY",""))
     openai_model = get_setting("openai_model", os.environ.get("OPENAI_MODEL", DEFAULT_MODEL))
+    auto_minutes = get_setting("auto_minutes", "0")
     def_img_path, _ = get_default_image()
 
     con = db()
@@ -416,9 +462,10 @@ def admin():
         con.close()
 
     def card(r, published=False):
-        img = f"<img src='{r['image_url']}' style='max-width:200px'>" if r["image_url"] else "<em>— pas d’image —</em>"
+        img = f"<img src='{r['image_url']}' style='max-width:220px'>" if r["image_url"] else "<em>— pas d’image —</em>"
         state_btn = ("<button name='action' value='unpublish' class='secondary'>⏸️ Dépublier</button>"
                      if published else "<button name='action' value='publish' class='secondary'>✅ Publier</button>")
+        publish_at = (r["publish_at"] or "").replace("Z","")
         img_editor = f"""
         <form method="post" action="{url_for('edit_image', post_id=r['id'])}" enctype="multipart/form-data">
           <div class="grid">
@@ -439,29 +486,15 @@ def admin():
             <label>Titre<input name="title" value="{(r['title'] or '').replace('"','&quot;')}"></label>
             <label>Contenu<textarea name="body" rows="6">{r['body'] or ''}</textarea></label>
             <div class="grid">
+              <label>Programmer (date/heure)<input type="datetime-local" name="publish_at" value="{publish_at}"></label>
+            </div>
+            <div class="grid">
               <button name="action" value="save">💾 Enregistrer</button>
               {state_btn}
               <button name="action" value="delete" class="contrast">🗑️ Supprimer</button>
             </div>
           </form>
         </details>"""
-
-    default_img_block = f"""
-      <article>
-        <h4>Image par défaut (fallback)</h4>
-        <div>{'<img src="'+def_img_path+'" style="max-width:200px">' if def_img_path else '<em>— aucune image par défaut —</em>'}</div>
-        <form method="post" action="{url_for('upload_default_image')}" enctype="multipart/form-data">
-          <div class="grid">
-            <label>Fichier<input type="file" name="default_image_file" accept="image/*"></label>
-            <label>URL<input type="url" name="default_image_url" placeholder="https://..."></label>
-          </div>
-          <div class="grid">
-            <button name="act" value="set" class="secondary">📸 Mettre à jour</button>
-            <button name="act" value="clear" class="contrast">❌ Supprimer</button>
-          </div>
-        </form>
-      </article>
-    """
 
     body = f"""
     <h3>Paramètres</h3>
@@ -470,13 +503,27 @@ def admin():
         <div class="grid">
           <label>OpenAI API Key<input type="password" name="openai_key" placeholder="sk-..." value="{openai_key}"></label>
           <label>OpenAI Model<input name="openai_model" value="{openai_model}"></label>
+          <label>Import automatique (minutes, 0=off)<input name="auto_minutes" value="{auto_minutes}"></label>
         </div>
         <label>Sources RSS (une URL par ligne)<textarea name="feeds" rows="6">{feeds}</textarea></label>
         <button>💾 Enregistrer</button>
       </form>
     </article>
 
-    {default_img_block}
+    <article>
+      <h4>Image par défaut (fallback)</h4>
+      <div>{'<img src="'+def_img_path+'" style="max-width:220px">' if def_img_path else '<em>— aucune image par défaut —</em>'}</div>
+      <form method="post" action="{url_for('upload_default_image')}" enctype="multipart/form-data">
+        <div class="grid">
+          <label>Fichier<input type="file" name="default_image_file" accept="image/*"></label>
+          <label>URL<input type="url" name="default_image_url" placeholder="https://..."></label>
+        </div>
+        <div class="grid">
+          <button name="act" value="set" class="secondary">📸 Mettre à jour</button>
+          <button name="act" value="clear" class="contrast">❌ Supprimer</button>
+        </div>
+      </form>
+    </article>
 
     <article>
       <form method="post" action="{url_for('import_now')}" style="margin-top:1rem">
@@ -497,6 +544,8 @@ def save_settings():
     set_setting("openai_key", request.form.get("openai_key","").strip())
     set_setting("openai_model", request.form.get("openai_model","").strip() or DEFAULT_MODEL)
     set_setting("feeds", request.form.get("feeds",""))
+    set_setting("auto_minutes", request.form.get("auto_minutes","0").strip())
+    reschedule_jobs()
     flash("Paramètres enregistrés.")
     return redirect(url_for("admin"))
 
@@ -554,12 +603,14 @@ def edit_image(post_id):
 @app.post("/save/<int:post_id>")
 def save(post_id):
     if not session.get("ok"): return redirect(url_for("admin"))
-    action = request.form.get("action","save")
-    title  = clean_title(request.form.get("title",""))
-    body   = ensure_signature(request.form.get("body",""))
+    action     = request.form.get("action","save")
+    title      = clean_title(request.form.get("title",""))
+    body       = ensure_signature(request.form.get("body",""))
+    publish_at = request.form.get("publish_at","").strip() or None
+
     con = db()
-    con.execute("UPDATE posts SET title=?, body=?, updated_at=? WHERE id=?",
-                (title, body, datetime.now(timezone.utc).isoformat(timespec="minutes"), post_id))
+    con.execute("UPDATE posts SET title=?, body=?, publish_at=?, updated_at=? WHERE id=?",
+                (title, body, publish_at, datetime.now(timezone.utc).isoformat(timespec="minutes"), post_id))
     if action == "publish":
         con.execute("UPDATE posts SET status='published' WHERE id=?", (post_id,))
         flash("Publié.")
@@ -577,9 +628,58 @@ def save(post_id):
 @app.get("/logout")
 def logout(): session.clear(); return redirect(url_for("home"))
 
+# ================== JOBS (APScheduler) ==================
+scheduler = BackgroundScheduler()
+
+def job_auto_import():
+    feeds_txt = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
+    feed_list = [u.strip() for u in feeds_txt.splitlines() if u.strip()]
+    if not feed_list: return
+    try:
+        created, skipped = scrape_once(feed_list)
+        print(f"[AUTO-IMPORT] {created} nouveaux, {skipped} ignorés.")
+    except Exception as e:
+        print("[AUTO-IMPORT] error:", e)
+
+def job_auto_publish():
+    now_iso = datetime.now().replace(second=0, microsecond=0).isoformat()
+    con = db()
+    try:
+        rows = con.execute(
+            "SELECT id FROM posts WHERE status='draft' AND publish_at IS NOT NULL AND publish_at <= ?",
+            (now_iso,)
+        ).fetchall()
+        for r in rows:
+            con.execute("UPDATE posts SET status='published' WHERE id=?", (r["id"],))
+        con.commit()
+        if rows:
+            print(f"[AUTO-PUBLISH] {len(rows)} article(s) publiés.")
+    except Exception as e:
+        print("[AUTO-PUBLISH] error:", e)
+    finally:
+        con.close()
+
+def reschedule_jobs():
+    try:
+        scheduler.remove_job("auto_import")
+    except Exception: pass
+    minutes = 0
+    try: minutes = int(get_setting("auto_minutes","0") or "0")
+    except: minutes = 0
+    if minutes > 0:
+        scheduler.add_job(job_auto_import, "interval", minutes=minutes, id="auto_import", replace_existing=True)
+    # auto publish (chaque minute)
+    try:
+        scheduler.remove_job("auto_publish")
+    except Exception: pass
+    scheduler.add_job(job_auto_publish, "interval", minutes=1, id="auto_publish", replace_existing=True)
+
 # -------- boot --------
 def init_dirs(): os.makedirs("static/images", exist_ok=True)
 init_db(); init_dirs()
+if not scheduler.running:
+    scheduler.start()
+reschedule_jobs()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
