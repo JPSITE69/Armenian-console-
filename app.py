@@ -1,22 +1,25 @@
 from flask import Flask, request, redirect, url_for, Response, render_template_string, session, flash
-import sqlite3, os, hashlib, io, traceback, re, threading, time
+import sqlite3, os, hashlib, io, traceback, re, threading, time, json as _json
 from datetime import datetime, timezone
 import requests
 from bs4 import BeautifulSoup
 import feedparser
 from PIL import Image, UnidentifiedImageError
 
+# ================== CONFIG ==================
 APP_NAME   = "Console Arménienne"
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "armenie")
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me")
 DB_PATH    = "site.db"
 
+# Flux par défaut (tu peux les changer dans l’admin)
 DEFAULT_FEEDS = [
     "https://www.civilnet.am/news/feed/",
     "https://armenpress.am/rss/",
     "https://news.am/eng/rss/",
 ]
 
+# OpenAI via ENV (sera supplanté par les paramètres admin si renseignés)
 ENV_OPENAI_KEY   = os.environ.get("OPENAI_API_KEY", "").strip()
 ENV_OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
 
@@ -73,7 +76,7 @@ def set_setting(key, value):
     finally:
         con.close()
 
-# ================== HTTP & IMG ==================
+# ================== HTTP & IMAGES ==================
 def http_get(url, timeout=20):
     r = requests.get(url, timeout=timeout, allow_redirects=True, headers={
         "User-Agent": "Mozilla/5.0 (+RenderBot)",
@@ -106,7 +109,7 @@ def download_image(url):
         sha1 = hashlib.sha1(data).hexdigest()
         try:
             im = Image.open(io.BytesIO(data))
-            im.verify()
+            im.verify()  # valide l’image
         except UnidentifiedImageError:
             print(f"[IMG] Unidentified image, skipping: {url}")
             return None, None
@@ -147,59 +150,99 @@ def extract_article_text(html):
         node_text = re.sub(r"\s+", " ", text).strip()
     return node_text[:5000] if node_text else ""
 
-# ================== RÉÉCRITURE FR (TEXTE PUR + SIGNATURE) ==================
-def active_openai():
-    key = get_setting("openai_key", ENV_OPENAI_KEY)
-    model = get_setting("openai_model", ENV_OPENAI_MODEL)
-    return (key.strip(), model.strip())
-
+# ================== RÉÉCRITURE FR (TITRE + TEXTE) ==================
 TAG_RE = re.compile(r"<[^>]+>")
 
 def strip_tags(s: str) -> str:
     return TAG_RE.sub("", s or "")
 
-def rewrite_text_fr(title, raw_text):
-    """Retourne du TEXTE (sans balises) en FR, signé ' - Arménie Info'."""
+def active_openai():
+    key = get_setting("openai_key", ENV_OPENAI_KEY)
+    model = get_setting("openai_model", ENV_OPENAI_MODEL)
+    return (key.strip(), model.strip())
+
+def _title_from_text_fallback(fr_text: str) -> str:
+    """Titre FR court à partir du corps."""
+    t = (fr_text or "").strip()
+    if not t:
+        return "Actualité"
+    words = t.split()
+    base = " ".join(words[:10]).strip().rstrip(".,;:!?")
+    base = base[:80]
+    return base[:1].upper() + base[1:]
+
+def rewrite_article_fr(title_src: str, raw_text: str):
+    """
+    -> (title_fr, body_fr)
+    - supprime toutes balises en entrée/sortie
+    - corps en FR (150–220 mots), finit par " - Arménie Info"
+    - robuste si API OpenAI échoue
+    """
     if not raw_text:
-        return ""
+        return (title_src or "Actualité", "")
+
     key, model = active_openai()
-    base_prompt = (
-        "Réécris en FRANÇAIS un article clair (150–220 mots) à partir du texte ci-dessous. "
-        "Ton neutre et factuel, pas d’emoji, pas d’invention. "
-        "RENVOIE UNIQUEMENT DU TEXTE BRUT (PAS DE BALISES). "
-        "Termine par: - Arménie Info\n"
-        f"Titre: {title}\n\nTEXTE:\n{raw_text}"
-    )
+    clean_input = strip_tags(raw_text)
+
     if key:
         try:
+            prompt = (
+                "Tu es un journaliste francophone. "
+                "Traduis/réécris en FRANÇAIS le Titre et le Corps de l'article ci-dessous. "
+                "Ton neutre et factuel, 150–220 mots pour le corps. "
+                "RENVOIE STRICTEMENT du JSON avec les clés 'title' et 'body'. "
+                "Le 'body' doit être du TEXTE BRUT (PAS de balises HTML) et DOIT se terminer par: - Arménie Info.\n\n"
+                f"Titre (source): {title_src}\n"
+                f"Texte (source): {clean_input}"
+            )
             payload = {
                 "model": model or "gpt-4o-mini",
                 "temperature": 0.2,
                 "messages": [
-                    {"role":"system","content":"Tu es un journaliste francophone sobre et précis."},
-                    {"role":"user","content": base_prompt}
+                    {"role": "system", "content": "Tu écris en français clair et concis."},
+                    {"role": "user", "content": prompt}
                 ]
             }
-            r = requests.post("https://api.openai.com/v1/chat/completions",
-                              headers={"Authorization": f"Bearer {key}",
-                                       "Content-Type":"application/json"},
-                              json=payload, timeout=60)
+            r = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=payload, timeout=60
+            )
             j = r.json()
-            if j.get("choices"):
-                out = j["choices"][0]["message"]["content"].strip()
-                out = strip_tags(out)
-                if not out.endswith("- Arménie Info"):
-                    out += "\n\n- Arménie Info"
-                return out
+            out = (j.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+
+            # tente de parser JSON, sinon fallback heuristique
+            try:
+                data = _json.loads(out)
+                title_fr = strip_tags(data.get("title", "")).strip()
+                body_fr  = strip_tags(data.get("body", "")).strip()
+            except Exception:
+                parts = out.split("\n", 1)
+                title_fr = strip_tags(parts[0]).strip()
+                body_fr  = strip_tags(parts[1] if len(parts) > 1 else "").strip()
+
+            if not body_fr:
+                body_fr = strip_tags(clean_input)
+                body_fr = " ".join(body_fr.split()[:200]).strip()
+
+            if not body_fr.endswith("- Arménie Info"):
+                body_fr += "\n\n- Arménie Info"
+
+            if not title_fr:
+                title_fr = _title_from_text_fallback(body_fr)
+
+            return (title_fr, body_fr)
+
         except Exception as e:
-            print(f"[AI] rewrite failed: {e}")
-    # Fallback local (résumé simple + signature)
-    txt = strip_tags(raw_text)
-    words = txt.split()
-    out = " ".join(words[:200]).strip()
-    if not out.endswith("- Arménie Info"):
-        out += "\n\n- Arménie Info"
-    return out
+            print(f"[AI] rewrite_article_fr failed: {e}")
+
+    # ==== Fallback local (sans OpenAI) ====
+    fr_body = strip_tags(raw_text)
+    fr_body = " ".join(fr_body.split()[:200]).strip()
+    if not fr_body.endswith("- Arménie Info"):
+        fr_body += "\n\n- Arménie Info"
+    fr_title = _title_from_text_fallback(fr_body)
+    return (fr_title, fr_body)
 
 def html_from_entry(entry):
     if "content" in entry and entry.content:
@@ -207,7 +250,7 @@ def html_from_entry(entry):
         if isinstance(entry.content, dict): return entry.content.get("value","")
     return entry.get("summary","") or entry.get("description","")
 
-# ================== SCRAPE ==================
+# ================== SCRAPE (SANS Google) ==================
 def scrape_once(feeds):
     created, skipped = 0, 0
     for feed in feeds:
@@ -221,6 +264,7 @@ def scrape_once(feeds):
                 link = e.get("link") or ""
                 if not link:
                     skipped += 1; continue
+
                 # doublon par lien
                 con = db()
                 try:
@@ -229,8 +273,9 @@ def scrape_once(feeds):
                 finally:
                     con.close()
 
-                title = (e.get("title") or "(Sans titre)").strip()
-                # page
+                title_src = (e.get("title") or "(Sans titre)").strip()
+
+                # page → extraction texte
                 page_html = ""
                 try:
                     page_html = http_get(link)
@@ -253,8 +298,8 @@ def scrape_once(feeds):
                     finally:
                         con.close()
 
-                # réécriture en TEXTE + signature
-                body_text = rewrite_text_fr(title, article_text)
+                # TITRE + TEXTE EN FR (robuste) —> texte pur, signé
+                title_fr, body_text = rewrite_article_fr(title_src, article_text)
                 if not body_text:
                     skipped += 1; continue
 
@@ -264,7 +309,7 @@ def scrape_once(feeds):
                     con.execute("""INSERT INTO posts
                       (title, body, status, created_at, updated_at, publish_at, image_url, image_sha1, orig_link, source)
                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                      (title, body_text, "draft", now, now, None, local_path, sha1, link, fp.feed.get("title","")))
+                      (title_fr, body_text, "draft", now, now, None, local_path, sha1, link, fp.feed.get("title","")))
                     con.commit()
                     created += 1
                 finally:
@@ -345,8 +390,7 @@ def home():
     for r in rows:
         img = f"<img src='{r['image_url']}' alt='' style='max-width:100%;height:auto'>" if r["image_url"] else ""
         created = (r['created_at'] or '')[:16].replace('T',' ')
-        # body est du TEXTE → on remplace les sauts de ligne par <br>
-        body_html = (r['body'] or '').replace("\n", "<br>")
+        body_html = (r['body'] or '').replace("\n", "<br>")  # texte → HTML léger
         cards.append(f"<article><header><h3>{r['title']}</h3><small>{created}</small></header>{img}<p>{body_html}</p></article>")
     return page("<h2>Dernières publications</h2>" + "".join(cards), "Publications")
 
@@ -386,13 +430,13 @@ def admin():
 
     con = db()
     try:
-        drafts = con.execute("SELECT * FROM posts WHERE status='draft' ORDER BY id DESC").fetchall()
+        drafts    = con.execute("SELECT * FROM posts WHERE status='draft' ORDER BY id DESC").fetchall()
         scheduled = con.execute("SELECT * FROM posts WHERE status='scheduled' ORDER BY publish_at ASC").fetchall()
-        pubs   = con.execute("SELECT * FROM posts WHERE status='published' ORDER BY id DESC").fetchall()
+        pubs      = con.execute("SELECT * FROM posts WHERE status='published' ORDER BY id DESC").fetchall()
     finally:
         con.close()
 
-    def card(r, published=False, scheduled=False):
+    def card(r, published=False):
         img = f"<img src='{r['image_url']}' style='max-width:200px'>" if r["image_url"] else ""
         pub_at = (r['publish_at'] or '')[:16]
         state_btns = ("<button name='action' value='unpublish' class='secondary'>⏸️ Dépublier</button>"
@@ -457,12 +501,15 @@ def save_settings():
     flash("Paramètres enregistrés.")
     return redirect(url_for("admin"))
 
-# --- Import : POST normal + GET toléré (redirige proprement) ---
+# --- Import via bouton (POST). Si quelqu’un tape l’URL en GET, on redirige.
 @app.post("/import-now")
 def import_now():
     if not session.get("ok"): return redirect(url_for("admin"))
     feeds_txt = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
     feed_list = [u.strip() for u in feeds_txt.splitlines() if u.strip()]
+    if not feed_list:
+        flash("Aucune source RSS configurée.")
+        return redirect(url_for("admin"))
     try:
         created, skipped = scrape_once(feed_list)
         flash(f"Import terminé : {created} nouveaux, {skipped} ignorés.")
@@ -474,17 +521,15 @@ def import_now():
 
 @app.get("/import-now")
 def import_now_get():
-    # Si quelqu’un tape l’URL /import-now en GET → pas de 405,
-    # juste un retour à l’admin.
     flash("Utilise le bouton « Importer maintenant » dans l’admin.")
     return redirect(url_for("admin"))
 
 @app.post("/save/<int:post_id>")
 def save(post_id):
     if not session.get("ok"): return redirect(url_for("admin"))
-    action = request.form.get("action","save")
-    title  = request.form.get("title","").strip()
-    body   = strip_tags(request.form.get("body","").strip())  # garantit texte pur si on édite à la main
+    action     = request.form.get("action","save")
+    title      = strip_tags(request.form.get("title","").strip())
+    body       = strip_tags(request.form.get("body","").strip())  # texte pur
     publish_at = request.form.get("publish_at","").strip()
 
     # s’assurer de la signature
@@ -532,4 +577,5 @@ init_db()
 threading.Thread(target=publish_due_loop, daemon=True).start()
 
 if __name__ == "__main__":
+    # En local seulement
     app.run(host="0.0.0.0", port=5000, debug=True)
