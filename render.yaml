@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: armenien-console
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ADMIN_PASS
+        value: armenie
+      - key: FEEDS
+        value: '["https://www.armenpress.am/rss/","https://www.civilnet.am/feed/","https://armtimes.com/rss","https://factor.am/feed"]'
