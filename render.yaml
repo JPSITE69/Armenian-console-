@@ -1,10 +1,2 @@
-services:
-  - type: web
-    name: console-armenienne
-    env: python
-    plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn app:app"
-
-
+gunicorn -w 1 -k gthread --threads 8 app:app
 
