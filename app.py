@@ -49,7 +49,7 @@ def init_db():
         status TEXT DEFAULT 'draft',         -- draft | scheduled | published
         created_at TEXT,
         updated_at TEXT,
-        publish_at TEXT,                     -- ISO UTC when scheduled
+        publish_at TEXT,                     -- UTC ISO when scheduled
         image_url TEXT,
         image_sha1 TEXT,
         orig_link TEXT UNIQUE,
@@ -85,14 +85,6 @@ TAG_RE = re.compile(r"<[^>]+>")
 
 def strip_tags(s: str) -> str:
     return TAG_RE.sub("", s or "")
-
-def looks_french(text: str) -> bool:
-    if not text or len(text) < 40:
-        return False
-    try:
-        return detect(text) == "fr"
-    except LangDetectException:
-        return False
 
 def sanitize_filename(s: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]+", "-", (s or "").strip())[:40] or "img"
@@ -245,7 +237,7 @@ def create_placeholder_image(title: str):
     img.save(path, "JPEG", quality=88)
     return "/"+path, sha1
 
-# ---- Ton image par défaut (portrait) ----
+# ---- Image par défaut (ta photo) ----
 def get_default_image():
     path = get_setting("default_image_path", "").strip()
     sha  = get_setting("default_image_sha1", "").strip()
@@ -321,31 +313,30 @@ def active_openai():
 
 def rewrite_article_fr(title_src: str, raw_text: str):
     """
-    -> (title_fr, body_fr, sure_fr)
-    Force le FR (2 tentatives OpenAI) sinon fallback local '(à traduire)'.
-    Corps: texte brut, finit par ' - Arménie Info'
+    ⚑ Retourne toujours du FR (titre + body).
+    - Si OpenAI configuré → traduction/réécriture en français (titre + corps).
+    - Sinon → brouillon avec mention explicite (en FR) pour éviter tout texte source.
+    Le corps se termine par ' - Arménie Info'.
     """
     if not raw_text:
-        return (title_src or "Actualité", "", False)
+        return (title_src or "Actualité", "(Vide) - Arménie Info", True)
 
     key, model = active_openai()
     clean_input = strip_tags(raw_text)
 
     def call_openai():
         prompt = (
-            "Tu es un journaliste francophone. "
-            "Traduis/réécris en FRANÇAIS le Titre et le Corps de l'article ci-dessous. "
-            "Ton neutre et factuel, 150–220 mots pour le corps. "
-            "RENVOIE STRICTEMENT du JSON avec les clés 'title' et 'body'. "
-            "Le 'body' est du TEXTE BRUT (PAS de balises HTML) et DOIT se terminer par: - Arménie Info.\n\n"
-            f"Titre (source): {title_src}\n"
-            f"Texte (source): {clean_input}"
+            "Réécris intégralement en FRANÇAIS cet article. "
+            "Le TITRE et le CORPS doivent être clairs, neutres et factuels. "
+            "Le CORPS doit faire 150 à 220 mots et se terminer par : - Arménie Info.\n\n"
+            f"Titre (source) : {title_src}\n"
+            f"Texte (source) : {clean_input}"
         )
         payload = {
             "model": model or "gpt-4o-mini",
-            "temperature": 0.2,
+            "temperature": 0.3,
             "messages": [
-                {"role": "system", "content": "Tu écris en français clair et concis. Réponds uniquement au format demandé."},
+                {"role": "system", "content": "Tu es un journaliste francophone. Réponds uniquement avec le titre sur la première ligne puis le texte."},
                 {"role": "user", "content": prompt}
             ]
         }
@@ -354,17 +345,10 @@ def rewrite_article_fr(title_src: str, raw_text: str):
                           json=payload, timeout=60)
         j = r.json()
         out = (j.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
-        try:
-            data = _json.loads(out)
-            t = strip_tags(data.get("title","")).strip()
-            b = strip_tags(data.get("body","")).strip()
-        except Exception:
-            parts = out.split("\n", 1)
-            t = strip_tags(parts[0]).strip()
-            b = strip_tags(parts[1] if len(parts) > 1 else "").strip()
-        if not b:
-            b = strip_tags(clean_input)
-            b = " ".join(b.split()[:200]).strip()
+        # On sépare titre / corps heuristiquement (1re ligne = titre)
+        parts = out.split("\n", 1)
+        t = strip_tags(parts[0]).strip()
+        b = strip_tags(parts[1] if len(parts) > 1 else "").strip()
         if not b.endswith("- Arménie Info"):
             b += "\n\n- Arménie Info"
         if not t:
@@ -373,27 +357,19 @@ def rewrite_article_fr(title_src: str, raw_text: str):
 
     if key:
         try:
-            t1, b1 = call_openai()
-            if looks_french(b1) and looks_french(t1):
-                return (t1, b1, True)
-            print("[AI] Second attempt to enforce FR")
-            t2, b2 = call_openai()
-            if looks_french(b2) and looks_french(t2):
-                return (t2, b2, True)
-            if not b2.endswith("- Arménie Info"):
-                b2 += "\n\n- Arménie Info"
-            b2 += "\n(à traduire)"
-            return (_title_from_text_fallback(b2), b2, False)
+            t, b = call_openai()
+            return (t, b, True)
         except Exception as e:
             print(f"[AI] rewrite_article_fr failed: {e}")
-
-    fr_body = strip_tags(raw_text)
-    fr_body = " ".join(fr_body.split()[:200]).strip()
-    if not fr_body.endswith("- Arménie Info"):
-        fr_body += "\n\n- Arménie Info"
-    fr_body += "\n(à traduire)"
-    fr_title = _title_from_text_fallback(fr_body)
-    return (fr_title, fr_body, False)
+            # On NE met PAS le texte source : message FR explicite
+            return (_title_from_text_fallback(clean_input),
+                    "Problème de traduction automatique. Réessaie depuis l’admin. - Arménie Info",
+                    False)
+    else:
+        # Pas de clé → on reste en brouillon avec message FR explicite
+        return (_title_from_text_fallback(clean_input),
+                "Traduction désactivée : ajoute ta clé OPENAI_API_KEY dans Paramètres. - Arménie Info",
+                False)
 
 # ================== SCRAPE ==================
 def scrape_once(feeds):
@@ -433,11 +409,12 @@ def scrape_once(feeds):
                 img_url = get_image_from_entry(e, page_html=page_html, page_url=link) or None
                 local_path, sha1 = download_image(img_url) if img_url else (None, None)
 
-                title_fr, body_text, sure_fr = rewrite_article_fr(title_src, article_text)
+                # TITRE + TEXTE EN FR (d’office)
+                title_fr, body_text, _sure = rewrite_article_fr(title_src, article_text)
                 if not body_text:
                     skipped += 1; continue
 
-                # --- Image fallback: ta photo perso si configurée, sinon placeholder
+                # Image fallback : ta photo (si définie), sinon placeholder
                 if not local_path:
                     def_p, def_s = get_default_image()
                     if def_p:
@@ -625,7 +602,6 @@ def admin():
         state_btns = ("<button name='action' value='unpublish' class='secondary'>⏸️ Dépublier</button>"
                       if published else
                       "<button name='action' value='publish' class='secondary'>✅ Publier maintenant</button>")
-        # Formulaire d’édition d’image (upload fichier OU URL)
         img_editor = f"""
         <form method="post" action="{url_for('edit_image', post_id=r['id'])}" enctype="multipart/form-data">
           <div class="grid">
@@ -667,7 +643,7 @@ def admin():
     default_img_block = f"""
       <article>
         <h4>Image par défaut (fallback)</h4>
-        <p>Utilisée quand aucun visuel n’est trouvé. Idéal pour mettre <em>ta photo</em>.</p>
+        <p>Utilisée quand aucun visuel n’est trouvé (par exemple ta photo).</p>
         <div>
           {'<img src="'+def_img_path+'" style="max-width:200px">' if def_img_path else '<em>— aucune image par défaut —</em>'}
         </div>
@@ -688,7 +664,12 @@ def admin():
       </article>
     """
 
+    warn = ""
+    if not (openai_key or "").strip():
+        warn = "<article class='contrast'><b>⚠️ Traduction désactivée :</b> ajoute ta clé OpenAI dans Paramètres pour obtenir les textes en français.</article>"
+
     body = f"""
+    {warn}
     <h3>Paramètres</h3>
     <article>
       <form method="post" action="{url_for('save_settings')}">
@@ -747,7 +728,6 @@ def upload_default_image():
         set_setting("default_image_sha1","")
         flash("Image par défaut supprimée.")
         return redirect(url_for("admin"))
-    # set / update
     fs = request.files.get("default_image_file")
     url = request.form.get("default_image_url","").strip()
     p = s = None
@@ -807,7 +787,6 @@ def edit_image(post_id):
         flash("Image retirée.")
         return redirect(url_for("admin"))
 
-    # replace (file or url)
     fs = request.files.get("file")
     url = request.form.get("url","").strip()
     p = s = None
@@ -819,7 +798,6 @@ def edit_image(post_id):
         flash("Impossible de remplacer l’image (fichier/URL invalide).")
         return redirect(url_for("admin"))
 
-    # anti-doublon image
     con = db()
     try:
         if s and con.execute("SELECT 1 FROM posts WHERE image_sha1=? AND id<>?", (s, post_id)).fetchone():
