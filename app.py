@@ -16,18 +16,15 @@ ADMIN_PASS = os.environ.get("ADMIN_PASS", "armenie")
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me")
 DB_PATH    = "site.db"
 
-# Flux par défaut (modifiable dans l’admin)
 DEFAULT_FEEDS = [
     "https://www.civilnet.am/news/feed/",
     "https://armenpress.am/rss/",
     "https://news.am/eng/rss/",
 ]
 
-# OpenAI via ENV (remplaçable par Paramètres admin)
 ENV_OPENAI_KEY   = os.environ.get("OPENAI_API_KEY", "").strip()
 ENV_OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
 
-# Heure locale de saisie dans l’admin (convertie en UTC)
 LOCAL_TZ_NAME = "Europe/Paris"
 
 app = Flask(__name__)
@@ -52,7 +49,7 @@ def init_db():
         status TEXT DEFAULT 'draft',         -- draft | scheduled | published
         created_at TEXT,
         updated_at TEXT,
-        publish_at TEXT,                     -- ISO UTC quand planifié
+        publish_at TEXT,                     -- ISO UTC when scheduled
         image_url TEXT,
         image_sha1 TEXT,
         orig_link TEXT UNIQUE,
@@ -102,8 +99,7 @@ def sanitize_filename(s: str) -> str:
 
 def _title_from_text_fallback(fr_text: str) -> str:
     t = (fr_text or "").strip()
-    if not t:
-        return "Actualité"
+    if not t: return "Actualité"
     words = t.split()
     base = " ".join(words[:10]).strip().rstrip(".,;:!?")
     base = base[:80]
@@ -120,7 +116,6 @@ def looks_duplicate_title(con, title: str, threshold: float = 0.9) -> bool:
     return False
 
 def local_to_utc_iso(local_dt_str: str, tz_name=LOCAL_TZ_NAME) -> str:
-    # local_dt_str: 'YYYY-MM-DDTHH:MM'
     try:
         naive = datetime.strptime(local_dt_str, "%Y-%m-%dT%H:%M")
         tz = pytz.timezone(tz_name)
@@ -143,26 +138,22 @@ def http_get(url, timeout=20):
 
 def find_main_image_in_html(html, base_url=None):
     soup = BeautifulSoup(html, "html.parser")
-    # og:image / twitter:image
     for sel, attr in [("meta[property='og:image']", "content"),
                       ("meta[name='twitter:image']", "content")]:
         m = soup.select_one(sel)
         if m and m.get(attr):
             return urljoin(base_url or "", m[attr])
-    # première image dans <article>
     a = soup.find("article")
     if a:
         imgtag = a.find("img")
         if imgtag and imgtag.get("src"):
             return urljoin(base_url or "", imgtag["src"])
-    # fallback: première image globale
     imgtag = soup.find("img")
     if imgtag and imgtag.get("src"):
         return urljoin(base_url or "", imgtag["src"])
     return None
 
 def get_image_from_entry(entry, page_html=None, page_url=None):
-    # 1) champs RSS media/enclosure/links
     try:
         media = entry.get("media_content") or entry.get("media_thumbnail")
         if isinstance(media, list) and media:
@@ -179,7 +170,6 @@ def get_image_from_entry(entry, page_html=None, page_url=None):
                     return urljoin(page_url or "", href)
     except Exception:
         pass
-    # 2) img dans contenu RSS
     for k in ("content","summary","description"):
         v = entry.get(k)
         if not v: continue
@@ -195,29 +185,30 @@ def get_image_from_entry(entry, page_html=None, page_url=None):
             imgtag = s.find("img")
             if imgtag and imgtag.get("src"):
                 return urljoin(page_url or "", imgtag["src"])
-    # 3) page HTML
     if page_html:
         return find_main_image_in_html(page_html, base_url=page_url)
-    return None  # placeholder sera généré si besoin
+    return None  # placeholder ou image par défaut ensuite
+
+def _save_bytes_to_image(data: bytes):
+    sha1 = hashlib.sha1(data).hexdigest()
+    try:
+        im = Image.open(io.BytesIO(data))
+        im.verify()
+    except (UnidentifiedImageError, Exception) as e:
+        print(f"[IMG] verify fail: {e}")
+        return None, None
+    os.makedirs("static/images", exist_ok=True)
+    path = f"static/images/{sha1}.jpg"
+    if not os.path.exists(path):
+        with open(path, "wb") as f: f.write(data)
+    return "/"+path, sha1
 
 def download_image(url):
     if not url: return None, None
     try:
         r = requests.get(url, timeout=20)
         r.raise_for_status()
-        data = r.content
-        sha1 = hashlib.sha1(data).hexdigest()
-        try:
-            im = Image.open(io.BytesIO(data))
-            im.verify()
-        except (UnidentifiedImageError, Exception) as e:
-            print(f"[IMG] verify fail {url}: {e}")
-            return None, None
-        os.makedirs("static/images", exist_ok=True)
-        path = f"static/images/{sha1}.jpg"
-        if not os.path.exists(path):
-            with open(path, "wb") as f: f.write(data)
-        return "/"+path, sha1
+        return _save_bytes_to_image(r.content)
     except Exception as e:
         print(f"[IMG] download failed for {url}: {e}")
         return None, None
@@ -231,7 +222,6 @@ def create_placeholder_image(title: str):
         font = ImageFont.truetype("arial.ttf", 48)
     except Exception:
         font = ImageFont.load_default()
-    # wrap simple
     words = text.split()
     lines, line, max_w = [], "", int(W*0.85)
     for w in words:
@@ -254,6 +244,44 @@ def create_placeholder_image(title: str):
     path = f"static/images/placeholder-{name}-{sha1[:8]}.jpg"
     img.save(path, "JPEG", quality=88)
     return "/"+path, sha1
+
+# ---- Ton image par défaut (portrait) ----
+def get_default_image():
+    path = get_setting("default_image_path", "").strip()
+    sha  = get_setting("default_image_sha1", "").strip()
+    return (path or None, sha or None)
+
+def set_default_image_from_bytes(data: bytes):
+    p, s = _save_bytes_to_image(data)
+    if p and s:
+        set_setting("default_image_path", p)
+        set_setting("default_image_sha1", s)
+    return p, s
+
+def set_default_image_from_url(url: str):
+    p, s = download_image(url)
+    if p and s:
+        set_setting("default_image_path", p)
+        set_setting("default_image_sha1", s)
+    return p, s
+
+def save_uploaded_image(fs):
+    if not fs: return (None, None)
+    try:
+        data = fs.read()
+        return set_default_image_from_bytes(data)
+    except Exception as e:
+        print("[UPLOAD] error:", e)
+        return (None, None)
+
+def save_post_image_file(fs):
+    if not fs: return (None, None)
+    try:
+        data = fs.read()
+        return _save_bytes_to_image(data)
+    except Exception as e:
+        print("[UPLOAD POST IMG] error:", e)
+        return (None, None)
 
 # ================== EXTRACTION TEXTE ==================
 SEL_CANDIDATES = [
@@ -294,9 +322,7 @@ def active_openai():
 def rewrite_article_fr(title_src: str, raw_text: str):
     """
     -> (title_fr, body_fr, sure_fr)
-    Force le FR :
-      - 2 tentatives OpenAI si pas FR à la 1re
-      - fallback local + '(à traduire)' en brouillon
+    Force le FR (2 tentatives OpenAI) sinon fallback local '(à traduire)'.
     Corps: texte brut, finit par ' - Arménie Info'
     """
     if not raw_text:
@@ -354,7 +380,6 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             t2, b2 = call_openai()
             if looks_french(b2) and looks_french(t2):
                 return (t2, b2, True)
-            # encore non FR
             if not b2.endswith("- Arménie Info"):
                 b2 += "\n\n- Arménie Info"
             b2 += "\n(à traduire)"
@@ -362,7 +387,6 @@ def rewrite_article_fr(title_src: str, raw_text: str):
         except Exception as e:
             print(f"[AI] rewrite_article_fr failed: {e}")
 
-    # Fallback local (pas de vraie traduction)
     fr_body = strip_tags(raw_text)
     fr_body = " ".join(fr_body.split()[:200]).strip()
     if not fr_body.endswith("- Arménie Info"):
@@ -386,7 +410,6 @@ def scrape_once(feeds):
                 if not link:
                     skipped += 1; continue
 
-                # doublon par lien
                 con = db()
                 try:
                     if con.execute("SELECT 1 FROM posts WHERE orig_link=?", (link,)).fetchone():
@@ -396,7 +419,6 @@ def scrape_once(feeds):
 
                 title_src = (e.get("title") or "(Sans titre)").strip()
 
-                # page → extraction texte
                 page_html = ""
                 try:
                     page_html = http_get(link)
@@ -408,18 +430,20 @@ def scrape_once(feeds):
                 if not article_text or len(article_text) < 120:
                     skipped += 1; continue
 
-                # image : RSS d'abord, puis page
                 img_url = get_image_from_entry(e, page_html=page_html, page_url=link) or None
                 local_path, sha1 = download_image(img_url) if img_url else (None, None)
 
-                # TITRE + TEXTE EN FR
                 title_fr, body_text, sure_fr = rewrite_article_fr(title_src, article_text)
                 if not body_text:
                     skipped += 1; continue
 
-                # placeholder si pas d'image
+                # --- Image fallback: ta photo perso si configurée, sinon placeholder
                 if not local_path:
-                    local_path, sha1 = create_placeholder_image(title_fr)
+                    def_p, def_s = get_default_image()
+                    if def_p:
+                        local_path, sha1 = def_p, def_s
+                    else:
+                        local_path, sha1 = create_placeholder_image(title_fr)
 
                 # anti-doublon image
                 if sha1:
@@ -430,7 +454,7 @@ def scrape_once(feeds):
                     finally:
                         con.close()
 
-                # anti-doublon titre approchant
+                # anti-doublon titre
                 con = db()
                 try:
                     if looks_duplicate_title(con, title_fr):
@@ -481,7 +505,6 @@ def publish_due_loop():
         time.sleep(30)
 
 def import_auto_loop():
-    """Import automatique selon le paramètre 'import_every_minutes'."""
     last_run = 0
     while True:
         try:
@@ -586,6 +609,7 @@ def admin():
     openai_key   = get_setting("openai_key", ENV_OPENAI_KEY)
     openai_model = get_setting("openai_model", ENV_OPENAI_MODEL)
     import_minutes = int(get_setting("import_every_minutes", "0") or "0")
+    def_img_path, _ = get_default_image()
 
     con = db()
     try:
@@ -596,15 +620,33 @@ def admin():
         con.close()
 
     def card(r, published=False):
-        img = f"<img src='{r['image_url']}' style='max-width:200px'>" if r["image_url"] else ""
+        img = f"<img src='{r['image_url']}' style='max-width:200px'>" if r["image_url"] else "<em>— pas d’image —</em>"
         pub_at = (r['publish_at'] or '')[:16]
         state_btns = ("<button name='action' value='unpublish' class='secondary'>⏸️ Dépublier</button>"
                       if published else
                       "<button name='action' value='publish' class='secondary'>✅ Publier maintenant</button>")
+        # Formulaire d’édition d’image (upload fichier OU URL)
+        img_editor = f"""
+        <form method="post" action="{url_for('edit_image', post_id=r['id'])}" enctype="multipart/form-data">
+          <div class="grid">
+            <label>Remplacer l’image (fichier)
+              <input type="file" name="file" accept="image/*">
+            </label>
+            <label>… ou via URL
+              <input type="url" name="url" placeholder="https://...">
+            </label>
+          </div>
+          <div class="grid">
+            <button name="img_action" value="replace" class="secondary">🔄 Remplacer</button>
+            <button name="img_action" value="remove" class="contrast">🗑️ Retirer l’image</button>
+          </div>
+        </form>
+        """
         return f"""
         <details>
           <summary><b>{r['title'] or '(Sans titre)'}</b> — <small>{r['status']}</small></summary>
           {img}
+          {img_editor}
           <form method="post" action="{url_for('save', post_id=r['id'])}">
             <label>Titre<input name="title" value="{(r['title'] or '').replace('"','&quot;')}"></label>
             <label>Contenu<textarea name="body" rows="6">{r['body'] or ''}</textarea></label>
@@ -621,6 +663,30 @@ def admin():
             </div>
           </form>
         </details>"""
+
+    default_img_block = f"""
+      <article>
+        <h4>Image par défaut (fallback)</h4>
+        <p>Utilisée quand aucun visuel n’est trouvé. Idéal pour mettre <em>ta photo</em>.</p>
+        <div>
+          {'<img src="'+def_img_path+'" style="max-width:200px">' if def_img_path else '<em>— aucune image par défaut —</em>'}
+        </div>
+        <form method="post" action="{url_for('upload_default_image')}" enctype="multipart/form-data">
+          <div class="grid">
+            <label>Choisir un fichier
+              <input type="file" name="default_image_file" accept="image/*">
+            </label>
+            <label>… ou URL
+              <input type="url" name="default_image_url" placeholder="https://...">
+            </label>
+          </div>
+          <div class="grid">
+            <button name="act" value="set" class="secondary">📸 Mettre à jour l’image par défaut</button>
+            <button name="act" value="clear" class="contrast">❌ Supprimer l’image par défaut</button>
+          </div>
+        </form>
+      </article>
+    """
 
     body = f"""
     <h3>Paramètres</h3>
@@ -644,6 +710,11 @@ def admin():
         </label>
         <button>💾 Enregistrer les paramètres</button>
       </form>
+    </article>
+
+    {default_img_block}
+
+    <article>
       <form method="post" action="{url_for('import_now')}" style="margin-top:1rem">
         <button type="submit">🔁 Importer maintenant (scraping + réécriture)</button>
       </form>
@@ -656,6 +727,7 @@ def admin():
     """
     return page(body, "Admin")
 
+# -------- Routes paramètres / import ----------
 @app.post("/save-settings")
 def save_settings():
     if not session.get("ok"): return redirect(url_for("admin"))
@@ -664,6 +736,29 @@ def save_settings():
     set_setting("import_every_minutes", request.form.get("import_every_minutes","0").strip() or "0")
     set_setting("feeds", request.form.get("feeds",""))
     flash("Paramètres enregistrés.")
+    return redirect(url_for("admin"))
+
+@app.post("/upload-default-image")
+def upload_default_image():
+    if not session.get("ok"): return redirect(url_for("admin"))
+    act = request.form.get("act","set")
+    if act == "clear":
+        set_setting("default_image_path","")
+        set_setting("default_image_sha1","")
+        flash("Image par défaut supprimée.")
+        return redirect(url_for("admin"))
+    # set / update
+    fs = request.files.get("default_image_file")
+    url = request.form.get("default_image_url","").strip()
+    p = s = None
+    if fs and fs.filename:
+        p, s = save_uploaded_image(fs)
+    elif url:
+        p, s = set_default_image_from_url(url)
+    if p:
+        flash("Image par défaut mise à jour.")
+    else:
+        flash("Impossible de définir l’image par défaut (fichier/URL invalide).")
     return redirect(url_for("admin"))
 
 @app.post("/import-now")
@@ -688,6 +783,56 @@ def import_now_get():
     flash("Utilise le bouton « Importer maintenant » dans l’admin.")
     return redirect(url_for("admin"))
 
+# -------- Édition d’image par post ----------
+@app.post("/image/<int:post_id>")
+def edit_image(post_id):
+    if not session.get("ok"): return redirect(url_for("admin"))
+    action = request.form.get("img_action","replace")
+    con = db()
+    try:
+        row = con.execute("SELECT id FROM posts WHERE id=?", (post_id,)).fetchone()
+        if not row:
+            flash("Article introuvable.")
+            return redirect(url_for("admin"))
+    finally:
+        con.close()
+
+    if action == "remove":
+        con = db()
+        try:
+            con.execute("UPDATE posts SET image_url=NULL, image_sha1=NULL WHERE id=?", (post_id,))
+            con.commit()
+        finally:
+            con.close()
+        flash("Image retirée.")
+        return redirect(url_for("admin"))
+
+    # replace (file or url)
+    fs = request.files.get("file")
+    url = request.form.get("url","").strip()
+    p = s = None
+    if fs and fs.filename:
+        p, s = save_post_image_file(fs)
+    elif url:
+        p, s = download_image(url)
+    if not p:
+        flash("Impossible de remplacer l’image (fichier/URL invalide).")
+        return redirect(url_for("admin"))
+
+    # anti-doublon image
+    con = db()
+    try:
+        if s and con.execute("SELECT 1 FROM posts WHERE image_sha1=? AND id<>?", (s, post_id)).fetchone():
+            flash("Cette image est déjà utilisée par un autre article.")
+        con.execute("UPDATE posts SET image_url=?, image_sha1=? WHERE id=?", (p, s, post_id))
+        con.commit()
+    finally:
+        con.close()
+
+    flash("Image mise à jour.")
+    return redirect(url_for("admin"))
+
+# -------- Sauvegarde / planification ----------
 @app.post("/save/<int:post_id>")
 def save(post_id):
     if not session.get("ok"): return redirect(url_for("admin"))
@@ -713,7 +858,7 @@ def save(post_id):
             if not publish_at:
                 flash(f"Choisis une date/heure ({LOCAL_TZ_NAME}) pour planifier.")
             else:
-                iso_utc = local_to_utc_iso(publish_at, LOCAL_TZ_NAME)  # stocké en UTC
+                iso_utc = local_to_utc_iso(publish_at, LOCAL_TZ_NAME)
                 if not iso_utc:
                     flash("Format de date/heure invalide.")
                 else:
@@ -729,6 +874,7 @@ def save(post_id):
         con.close()
     return redirect(url_for("admin"))
 
+# -------- Divers ----------
 @app.get("/logout")
 def logout():
     session.clear(); return redirect(url_for("home"))
@@ -738,10 +884,13 @@ def alias_console():
     return redirect(url_for("admin"))
 
 # --------- boot ---------
+def init_dirs():
+    os.makedirs("static/images", exist_ok=True)
+
 init_db()
+init_dirs()
 threading.Thread(target=publish_due_loop, daemon=True).start()
 threading.Thread(target=import_auto_loop, daemon=True).start()
 
 if __name__ == "__main__":
-    # Dev local
     app.run(host="0.0.0.0", port=5000, debug=True)
