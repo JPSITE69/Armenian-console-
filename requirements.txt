@@ -1,2 +1,6 @@
 Flask==3.0.3
 gunicorn==22.0.0
+feedparser==6.0.11
+beautifulsoup4==4.12.3
+requests==2.32.3
+Pillow==10.4.0
