@@ -7,18 +7,19 @@ from flask import Flask, request, redirect, url_for, session
 from openai import OpenAI
 from datetime import datetime
 
-# Initialisation de Flask
+# --- Flask ---
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "secret")
 
-# Clés et variables
+# --- Variables ---
 ADMIN_PASS = os.getenv("ADMIN_PASS", "armenie")
 DB_PATH = os.getenv("DB_PATH", "console.db")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# Client OpenAI (NE PAS PASSER la clé manuellement)
-client = OpenAI()
+# --- OpenAI Client (corrigé sans proxies) ---
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Création DB
+# --- DB Init ---
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -38,7 +39,7 @@ init_db()
 
 # --- Fonctions utiles ---
 def fetch_image_from_url(url):
-    """Récupère la première image d’un article si possible"""
+    """Récupère une image d’un article"""
     try:
         r = requests.get(url, timeout=5)
         soup = BeautifulSoup(r.text, "html.parser")
@@ -47,13 +48,14 @@ def fetch_image_from_url(url):
             return img["src"]
     except:
         pass
-    return None
+    return get_default_image()
 
 def rewrite_article(title, content):
-    """Réécriture avec GPT et mise en page"""
+    """Réécriture et traduction via GPT"""
     try:
         prompt = f"""
         Traduis et réécris en français l’article suivant.
+
         Titre : {title}
         Contenu : {content}
 
@@ -112,7 +114,7 @@ def admin():
         for feed_url in feeds:
             feed = feedparser.parse(feed_url)
             for entry in feed.entries[:5]:
-                image = fetch_image_from_url(entry.link) or get_default_image()
+                image = fetch_image_from_url(entry.link)
                 rewritten = rewrite_article(entry.title, entry.get("summary", ""))
                 save_article(entry.title, rewritten, image)
         return redirect(url_for("admin"))
@@ -189,7 +191,7 @@ def rss():
     rss += "</channel></rss>"
     return rss, {"Content-Type": "application/rss+xml"}
 
-# --- Gestion des paramètres ---
+# --- Paramètres ---
 def save_setting(key, value):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -211,11 +213,11 @@ def get_feeds():
 def get_default_image():
     return get_setting("default_image", "")
 
-# --- Santé ---
+# --- Health check ---
 @app.route("/health")
 def health():
     return "OK"
 
-# --- Lancement ---
+# --- Run ---
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
