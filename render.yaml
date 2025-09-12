@@ -11,3 +11,7 @@ services:
       - key: ADMIN_PASS
         value: armenie
     healthCheckPath: /health
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1
