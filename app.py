@@ -7,7 +7,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 
-# ====== CONFIG ======
+# ===== CONFIG =====
 APP_NAME       = "Console Arménienne"
 ADMIN_PASS     = os.environ.get("ADMIN_PASS", "armenie")
 SECRET_KEY     = os.environ.get("SECRET_KEY", "change-moi")
@@ -24,7 +24,6 @@ FEEDS = [
     "https://www.azatutyun.am/rssfeeds",
 ]
 
-# ====== APP ======
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 
@@ -32,7 +31,7 @@ app.secret_key = SECRET_KEY
 def health():
     return "OK"
 
-# ====== DB ======
+# ===== DB =====
 def db():
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
@@ -68,33 +67,29 @@ def set_setting(key, value):
     con.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (key, value))
     con.commit()
 
-# ====== IMAGES (simple & fiable) ======
+# ===== IMAGE =====
 def extract_image(entry):
-    # 1) <media:content>
     if "media_content" in entry and entry.media_content:
         u = entry.media_content[0].get("url")
         if u: return u
-    # 2) enclosures/images
     if "links" in entry:
         for link in entry.links:
             if link.get("type", "").startswith("image/"):
                 return link.get("href")
-    # 3) <img> dans summary/description
     html = entry.get("summary", "") or entry.get("description", "")
     if html:
         soup = BeautifulSoup(html, "html.parser")
         img = soup.find("img")
         if img and img.get("src"):
             return img["src"]
-    # 4) défaut
     return DEFAULT_IMAGE
 
-# ====== RÉÉCRITURE (FR + saut de ligne + signature unique) ======
+# ===== RÉÉCRITURE =====
 def rewrite_text(text: str) -> str:
     def _sign(t: str) -> str:
         t = t.strip()
         if not t.endswith("– Arménie Info"):
-            t = f"{t}\n\n– Arménie Info"  # saut de ligne avant signature
+            t = f"{t}\n\n– Arménie Info"   # <<< SAUT DE LIGNE
         return t
 
     key = get_setting("openai_key", "")
@@ -117,11 +112,10 @@ def rewrite_text(text: str) -> str:
     except Exception as e:
         return _sign(text + f"\n\n(Erreur traduction: {e})")
 
-# ====== IMPORT RSS ======
+# ===== IMPORT RSS =====
 def import_rss():
     con = db()
     cur = con.cursor()
-    created = 0
     for url in FEEDS:
         try:
             feed = feedparser.parse(url)
@@ -134,7 +128,6 @@ def import_rss():
             raw   = entry.get("summary", "") or entry.get("description", "") or ""
             image = extract_image(entry)
 
-            # dédup simple par titre
             cur.execute("SELECT 1 FROM posts WHERE title=?", (title,))
             if cur.fetchone():
                 continue
@@ -145,16 +138,13 @@ def import_rss():
                 "INSERT INTO posts (title, content, image, published, created_at) VALUES (?,?,?,?,?)",
                 (title, content, image, 0, now),
             )
-            created += 1
     con.commit()
-    print(f"[IMPORT] created={created}")
 
-# ====== ROUTES ======
+# ===== ROUTES =====
 @app.get("/")
 def index():
     con = db()
     posts = con.execute("SELECT * FROM posts WHERE published=1 ORDER BY id DESC").fetchall()
-    # garde les sauts de ligne dans <p>
     return render_template_string("""
     <h1>{{app_name}}</h1>
     {% for p in posts %}
@@ -171,7 +161,6 @@ def index():
 
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
-    # login minimal
     if not session.get("admin"):
         if request.method == "POST" and request.form.get("password") == ADMIN_PASS:
             session["admin"] = True
@@ -185,7 +174,6 @@ def admin():
         """
 
     key = get_setting("openai_key", "")
-
     con = db()
     drafts = con.execute("SELECT * FROM posts WHERE published=0 ORDER BY id DESC").fetchall()
     pubs   = con.execute("SELECT * FROM posts WHERE published=1 ORDER BY id DESC").fetchall()
@@ -199,7 +187,7 @@ def admin():
       <button>Enregistrer</button>
     </form>
 
-    <form method="post" action="{{ url_for('import_now') }}" style="margin-top:1rem">
+    <form method="post" action="{{ url_for('import_now') }}">
       <button>🔁 Importer maintenant</button>
     </form>
     <br>
@@ -241,13 +229,12 @@ def import_now():
 def publish(pid):
     content = (request.form.get("content") or "").strip()
     if not content.endswith("– Arménie Info"):
-        content = f"{content}\n\n– Arménie Info"
+        content = f"{content}\n\n– Arménie Info"   # <<< SAUT DE LIGNE
     con = db()
     con.execute("UPDATE posts SET content=?, published=1 WHERE id=?", (content, pid))
     con.commit()
     return redirect(url_for("index"))
 
-# ====== RSS FEED ======
 @app.get("/rss.xml")
 def rss():
     con = db()
@@ -256,7 +243,6 @@ def rss():
     for r in rows:
         title = (r["title"] or "").replace("&", "&amp;")
         desc  = (r["content"] or "")
-        # On met le contenu complet (avec sauts de ligne) en CDATA
         desc_cdata = f"<![CDATA[{desc}]]>"
         enclosure = ""
         if r["image"]:
@@ -272,7 +258,6 @@ def rss():
             f"<pubDate>{pubdate}</pubDate>"
             f"</item>"
         )
-
     rss_xml = (
         "<?xml version='1.0' encoding='UTF-8'?>"
         "<rss version='2.0'>"
@@ -285,10 +270,9 @@ def rss():
     )
     return Response(rss_xml, mimetype="application/rss+xml")
 
-# ====== MAIN ======
+# ===== MAIN =====
 def start_scheduler():
     sched = BackgroundScheduler()
-    # import auto toutes les 3h (stable)
     sched.add_job(import_rss, "interval", minutes=180)
     sched.start()
 
