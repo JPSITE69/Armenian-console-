@@ -11,8 +11,5 @@ services:
       - key: ADMIN_PASS
         value: armenie
       - key: DB_PATH
-        value: /var/data/console.db
-    disk:
-      name: data
-      mountPath: /var/data
+        value: console.db
     healthCheckPath: /health
