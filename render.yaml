@@ -9,4 +9,4 @@ services:
       - key: SECRET_KEY
         generateValue: true
       - key: ADMIN_PASS
-        value: armenie   # tu peux le changer si tu veux
+        value: armenie   # change si tu veux
