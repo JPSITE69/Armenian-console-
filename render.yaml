@@ -12,4 +12,6 @@ services:
         value: armenie
       - key: DB_PATH
         value: console.db
+      - key: OPENAI_API_KEY
+        sync: false   # valeur vide ici
     healthCheckPath: /health
