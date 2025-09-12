@@ -4,7 +4,7 @@ import feedparser
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, request, redirect, url_for, session
-from openai import OpenAI
+import openai
 from datetime import datetime
 
 # --- Flask ---
@@ -14,10 +14,6 @@ app.secret_key = os.getenv("SECRET_KEY", "secret")
 # --- Variables ---
 ADMIN_PASS = os.getenv("ADMIN_PASS", "armenie")
 DB_PATH = os.getenv("DB_PATH", "console.db")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-
-# --- OpenAI ---
-client = OpenAI(api_key=OPENAI_API_KEY)
 
 # --- DB ---
 def init_db():
@@ -38,6 +34,27 @@ def init_db():
 init_db()
 
 # --- Fonctions utiles ---
+def get_setting(key, default=""):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key=?", (key,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else default
+
+def save_setting(key, value):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+    conn.close()
+
+def get_feeds():
+    return get_setting("feeds", "").splitlines()
+
+def get_default_image():
+    return get_setting("default_image", "")
+
 def fetch_image_from_url(url):
     try:
         r = requests.get(url, timeout=5)
@@ -51,8 +68,11 @@ def fetch_image_from_url(url):
 
 def rewrite_article(title, content):
     """Traduction + réécriture FR via GPT"""
-    if not OPENAI_API_KEY:
+    api_key = get_setting("openai_api_key", "")
+    if not api_key:
         return f"{title}\n\n{content}\n\n— Arménie Info"
+
+    openai.api_key = api_key
     try:
         prompt = f"""
         Traduis et réécris en français l’article suivant.
@@ -64,12 +84,12 @@ def rewrite_article(title, content):
         - Contenu réécrit en français clair avec paragraphes <p>
         - Signature : Arménie Info
         """
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",   # ou gpt-4/gpt-4o-mini si dispo
             messages=[{"role": "user", "content": prompt}],
             temperature=0.6,
         )
-        return response.choices[0].message.content.strip()
+        return response.choices[0].message["content"].strip()
     except Exception as e:
         return f"{title}\n\n{content}\n\n— Arménie Info (Erreur GPT : {e})"
 
@@ -80,27 +100,6 @@ def save_article(title, content, image, status="draft"):
               (title, content, image, status, datetime.now().isoformat()))
     conn.commit()
     conn.close()
-
-def save_setting(key, value):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
-    conn.commit()
-    conn.close()
-
-def get_setting(key, default=""):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT value FROM settings WHERE key=?", (key,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else default
-
-def get_feeds():
-    return get_setting("feeds", "").splitlines()
-
-def get_default_image():
-    return get_setting("default_image", "")
 
 # --- Routes ---
 @app.route("/")
@@ -187,8 +186,17 @@ def settings():
         return redirect(url_for("admin"))
     if request.method == "POST":
         save_setting("default_image", request.form["default_image"])
+        save_setting("openai_api_key", request.form["openai_api_key"])
         return redirect(url_for("settings"))
-    return f"<h2>Paramètres</h2><form method='post'>Image par défaut : <input type='text' name='default_image' value='{get_default_image()}' size='50'><input type='submit' value='Sauvegarder'></form><br><a href='/admin'>Retour admin</a>"
+    return f"""
+    <h2>Paramètres</h2>
+    <form method='post'>
+      Image par défaut : <input type='text' name='default_image' value='{get_default_image()}' size='50'><br><br>
+      OpenAI API Key : <input type='password' name='openai_api_key' value='{get_setting("openai_api_key")}' size='50'><br><br>
+      <input type='submit' value='Sauvegarder'>
+    </form>
+    <br><a href='/admin'>Retour admin</a>
+    """
 
 @app.route("/logout")
 def logout():
