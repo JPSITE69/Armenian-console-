@@ -6,7 +6,7 @@ from flask import Flask, request, redirect, url_for, render_template_string, Res
 from bs4 import BeautifulSoup
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
-from openai import OpenAI
+import openai  # ✅ nouvelle manière d'utiliser OpenAI
 
 # --- Config ---
 DB_PATH = os.environ.get("DB_PATH", "console.db")
@@ -15,7 +15,7 @@ DEFAULT_IMAGE = os.environ.get("DEFAULT_IMAGE", "https://placehold.co/600x400?te
 FEEDS = eval(os.environ.get("FEEDS", "[]"))  # liste JSON de flux
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+openai.api_key = OPENAI_API_KEY  # ✅ correcte pour openai>=1.0
 
 app = Flask(__name__)
 scheduler = BackgroundScheduler()
@@ -87,7 +87,7 @@ def rewrite_article(title: str, content: str) -> (str, str):
     Contenu: {content}
     """
 
-    response = client.chat.completions.create(
+    response = openai.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.7
@@ -230,9 +230,6 @@ def admin():
 @app.route("/health")
 def health():
     return "OK", 200
-
-# --- Scheduler Example (publish article with id=1 in 1 min) ---
-# scheduler.add_job(lambda: publish_article(1), 'date', run_date=datetime.utcnow()+timedelta(minutes=1))
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
