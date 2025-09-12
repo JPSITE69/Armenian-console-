@@ -15,9 +15,16 @@ app.secret_key = os.getenv("SECRET_KEY", "secret")
 # --- Variables ---
 ADMIN_PASS = os.getenv("ADMIN_PASS", "armenie")
 DB_PATH = os.getenv("DB_PATH", "console.db")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Clé OpenAI stockée en base (fallback sur Render si vide)
+def get_openai_key():
+    key = get_setting("openai_key", "")
+    if not key:
+        key = os.getenv("OPENAI_API_KEY", "")
+    return key
+
+def get_client():
+    return OpenAI(api_key=get_openai_key())
 
 # --- Base de données ---
 def init_db():
@@ -57,6 +64,7 @@ def fetch_image_from_url(url):
 # --- GPT Rewrite ---
 def rewrite_article(title, content):
     try:
+        client = get_client()
         prompt = f"""
         Traduis et réécris en français l’article suivant.
 
@@ -143,7 +151,6 @@ def admin():
 
     action = request.args.get("action")
 
-    # Import articles
     if action == "import":
         feeds = get_feeds()
         for feed_url in feeds:
@@ -154,12 +161,10 @@ def admin():
                 save_article(entry.title, rewritten, image)
         return redirect(url_for("admin"))
 
-    # Publier
     if action == "publish":
         publish_article(request.args.get("id"))
         return redirect(url_for("admin"))
 
-    # Supprimer
     if action == "delete":
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -168,7 +173,6 @@ def admin():
         conn.close()
         return redirect(url_for("admin"))
 
-    # Modifier
     if action == "edit":
         aid = request.args.get("id")
         conn = sqlite3.connect(DB_PATH)
@@ -200,7 +204,7 @@ def admin():
     conn.close()
 
     html = "<h1>Admin Arménie Info</h1>"
-    html += "<a href='?action=import'>📥 Importer</a> | <a href='/feeds'>⚙️ Flux RSS</a> | <a href='/logout'>🚪 Déconnexion</a><hr>"
+    html += "<a href='?action=import'>📥 Importer</a> | <a href='/feeds'>⚙️ Flux RSS</a> | <a href='/apikey'>🔑 Clé API</a> | <a href='/logout'>🚪 Déconnexion</a><hr>"
     for a in articles:
         html += f"[{a[2]}] {a[1]} (⏰ {a[3] or 'non planifié'}) - <a href='?action=publish&id={a[0]}'>Publier</a> | <a href='?action=edit&id={a[0]}'>Modifier</a> | <a href='?action=delete&id={a[0]}'>Supprimer</a><br>"
     return html
@@ -214,6 +218,15 @@ def feeds():
         return redirect(url_for("feeds"))
     feeds = get_feeds()
     return f"<h2>Configurer les flux RSS</h2><form method='post'><textarea name='feeds' rows='5' cols='60'>{chr(10).join(feeds)}</textarea><br><input type='submit' value='Sauvegarder'></form><br><a href='/admin'>Retour</a>"
+
+@app.route("/apikey", methods=["GET", "POST"])
+def apikey():
+    if "logged_in" not in session:
+        return redirect(url_for("admin"))
+    if request.method == "POST":
+        save_setting("openai_key", request.form["openai_key"])
+        return redirect(url_for("apikey"))
+    return f"<h2>Clé OpenAI</h2><form method='post'>Clé API : <input type='password' name='openai_key' value='{get_openai_key()}' size='60'><input type='submit' value='Sauvegarder'></form><br><a href='/admin'>Retour</a>"
 
 @app.route("/logout")
 def logout():
