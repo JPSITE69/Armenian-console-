@@ -2,6 +2,7 @@ import os
 import sqlite3
 import feedparser
 import requests
+import json
 from flask import Flask, request, redirect, url_for, render_template_string, Response, abort, session
 from bs4 import BeautifulSoup
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -13,14 +14,30 @@ DB_PATH = os.environ.get("DB_PATH", "console.db")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "armenie")
 DEFAULT_IMAGE = os.environ.get("DEFAULT_IMAGE", "https://placehold.co/600x400?text=Armenie+Info")
 FEEDS = eval(os.environ.get("FEEDS", "[]"))  # fallback si feeds.txt absent
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-openai.api_key = OPENAI_API_KEY
+SETTINGS_FILE = "settings.json"
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "supersecret")
 scheduler = BackgroundScheduler()
 scheduler.start()
+
+# --- Settings ---
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        with open(SETTINGS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_settings(data):
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(data, f)
+
+def get_openai_key():
+    if os.environ.get("OPENAI_API_KEY"):
+        return os.environ.get("OPENAI_API_KEY")
+    settings = load_settings()
+    return settings.get("OPENAI_API_KEY")
 
 # --- DB init ---
 def init_db():
@@ -34,7 +51,8 @@ def init_db():
             image TEXT,
             link TEXT UNIQUE,
             status TEXT,
-            pub_date TEXT
+            pub_date TEXT,
+            publish_at TEXT
         )
     """)
     conn.commit()
@@ -73,10 +91,10 @@ def get_image_from_page(url: str, default_image: str = DEFAULT_IMAGE) -> str:
     return default_image
 
 def rewrite_article(title: str, content: str) -> (str, str):
-    """ Utilise GPT pour traduire + réécrire un article. """
-    if not OPENAI_API_KEY:
+    key = get_openai_key()
+    if not key:
         return title, content
-
+    openai.api_key = key
     prompt = f"""
     Traduis et réécris en français.
     Mets uniquement le texte révisé, sans explication.
@@ -84,27 +102,26 @@ def rewrite_article(title: str, content: str) -> (str, str):
     Titre: {title}
     Contenu: {content}
     """
-
-    response = openai.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7
-    )
-    text = response.choices[0].message.content.strip()
-
-    # Séparer le titre et le contenu si GPT renvoie les deux
-    lines = text.split("\n", 1)
-    if len(lines) == 2:
-        return lines[0].strip(), lines[1].strip()
-    else:
-        return title, text
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7
+        )
+        text = response.choices[0].message.content.strip()
+        lines = text.split("\n", 1)
+        if len(lines) == 2:
+            return lines[0].strip(), lines[1].strip()
+        else:
+            return title, text
+    except Exception:
+        return title, content
 
 def format_article(title_fr: str, content_fr: str) -> str:
     return f"{title_fr}\n\n{content_fr}\n\n— Arménie Info"
 
 # --- Feeds management ---
 def get_feeds():
-    """ Lit les flux RSS depuis feeds.txt, sinon fallback sur FEEDS. """
     if os.path.exists("feeds.txt"):
         with open("feeds.txt") as f:
             return [line.strip() for line in f.readlines() if line.strip()]
@@ -119,7 +136,6 @@ def import_articles():
                 continue
             title = entry.title
             summary = clean_html(getattr(entry, "summary", ""))
-            # Scraper page pour contenu complet et image
             image_url = get_image_from_page(link)
             try:
                 html = requests.get(link, timeout=5).text
@@ -128,10 +144,8 @@ def import_articles():
                 full_text = "\n".join(paragraphs) if paragraphs else summary
             except Exception:
                 full_text = summary
-            # Réécrire avec GPT
             title_fr, content_fr = rewrite_article(title, full_text)
             final_text = format_article(title_fr, content_fr)
-            # Sauvegarder en brouillon
             conn = sqlite3.connect(DB_PATH)
             cur = conn.cursor()
             cur.execute("""
@@ -140,6 +154,17 @@ def import_articles():
             """, (title_fr, final_text, image_url, link, datetime.utcnow().isoformat()))
             conn.commit()
             conn.close()
+
+# --- Scheduler ---
+def check_scheduled():
+    now = datetime.utcnow().isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE articles SET status='published' WHERE publish_at <= ? AND status='draft'", (now,))
+    conn.commit()
+    conn.close()
+
+scheduler.add_job(check_scheduled, "interval", minutes=1)
 
 # --- Routes publiques ---
 @app.route("/")
@@ -188,7 +213,7 @@ def feed():
     </rss>"""
     return Response(rss, mimetype="application/xml")
 
-# --- Admin avec login ---
+# --- Admin ---
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
     if "logged_in" in session and session["logged_in"]:
@@ -212,7 +237,7 @@ def admin():
 
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute("SELECT id, title, status FROM articles ORDER BY id DESC")
+        cur.execute("SELECT id, title, status, publish_at FROM articles ORDER BY id DESC")
         rows = cur.fetchall()
         conn.close()
 
@@ -220,13 +245,16 @@ def admin():
         <h1>Admin Arménie Info</h1>
         <a href="{{ url_for('admin', action='import') }}">Importer articles</a> |
         <a href="{{ url_for('manage_feeds') }}">Configurer les flux RSS</a> |
+        <a href="{{ url_for('settings_page') }}">Paramètres</a> |
         <a href="{{ url_for('logout') }}">Se déconnecter</a>
         <ul>
-        {% for id, title, status in rows %}
+        {% for id, title, status, publish_at in rows %}
           <li>
             <b>[{{ status }}]</b> {{ title }}
+            {% if publish_at %}(Planifié: {{ publish_at }}){% endif %}
             <a href="{{ url_for('admin', action='publish', id=id) }}">Publier</a>
-            <a href="{{ url_for('admin', action='delete', id=id) }}">Supprimer</a>
+            <a href="{{ url_for('edit_article', id=id) }}">Modifier</a>
+            <a href="{{ url_for('delete_article', id=id) }}">Supprimer</a>
           </li>
         {% endfor %}
         </ul>
@@ -248,6 +276,54 @@ def admin():
         <button type="submit">Se connecter</button>
     </form>
     """
+
+@app.route("/edit/<int:id>", methods=["GET", "POST"])
+def edit_article(id):
+    if "logged_in" not in session or not session["logged_in"]:
+        return redirect(url_for("admin"))
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    if request.method == "POST":
+        title = request.form.get("title")
+        content = request.form.get("content")
+        image = request.form.get("image")
+        publish_at = request.form.get("publish_at")
+        cur.execute("UPDATE articles SET title=?, content=?, image=?, publish_at=? WHERE id=?",
+                    (title, content, image, publish_at if publish_at else None, id))
+        conn.commit()
+        conn.close()
+        return redirect(url_for("admin"))
+
+    cur.execute("SELECT title, content, image, publish_at FROM articles WHERE id=?", (id,))
+    row = cur.fetchone()
+    conn.close()
+
+    html = """
+    <h1>Modifier article</h1>
+    <form method="post">
+        <input type="text" name="title" value="{{ row[0] }}" size="80"/><br><br>
+        <textarea name="content" rows="15" cols="80">{{ row[1] }}</textarea><br><br>
+        <input type="text" name="image" value="{{ row[2] }}" size="80"/><br><br>
+        <label>Planifier (UTC, ex: 2025-09-13T12:00:00):</label><br>
+        <input type="text" name="publish_at" value="{{ row[3] or '' }}" size="40"/><br><br>
+        <button type="submit">Sauvegarder</button>
+    </form>
+    <a href="{{ url_for('admin') }}">Retour admin</a>
+    """
+    return render_template_string(html, row=row)
+
+@app.route("/delete/<int:id>")
+def delete_article(id):
+    if "logged_in" not in session or not session["logged_in"]:
+        return redirect(url_for("admin"))
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM articles WHERE id=?", (id,))
+    conn.commit()
+    conn.close()
+    return redirect(url_for("admin"))
 
 @app.route("/feeds", methods=["GET", "POST"])
 def manage_feeds():
@@ -276,6 +352,30 @@ def manage_feeds():
     <a href="{{ url_for('admin') }}">Retour admin</a>
     """
     return render_template_string(html, feeds_text="\n".join(feeds_list))
+
+@app.route("/settings", methods=["GET", "POST"])
+def settings_page():
+    if "logged_in" not in session or not session["logged_in"]:
+        return redirect(url_for("admin"))
+
+    settings = load_settings()
+
+    if request.method == "POST":
+        api_key = request.form.get("OPENAI_API_KEY")
+        settings["OPENAI_API_KEY"] = api_key
+        save_settings(settings)
+        return redirect(url_for("settings_page"))
+
+    html = """
+    <h1>Paramètres</h1>
+    <form method="post">
+        <label>OpenAI API Key :</label><br>
+        <input type="text" name="OPENAI_API_KEY" value="{{ current_key }}" size="60"/><br><br>
+        <button type="submit">Sauvegarder</button>
+    </form>
+    <a href="{{ url_for('admin') }}">Retour admin</a>
+    """
+    return render_template_string(html, current_key=settings.get("OPENAI_API_KEY", ""))
 
 @app.route("/logout")
 def logout():
