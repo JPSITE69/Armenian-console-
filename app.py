@@ -12,13 +12,13 @@ import openai
 DB_PATH = os.environ.get("DB_PATH", "console.db")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "armenie")
 DEFAULT_IMAGE = os.environ.get("DEFAULT_IMAGE", "https://placehold.co/600x400?text=Armenie+Info")
-FEEDS = eval(os.environ.get("FEEDS", "[]"))  # liste JSON de flux
+FEEDS = eval(os.environ.get("FEEDS", "[]"))  # fallback si feeds.txt absent
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 openai.api_key = OPENAI_API_KEY
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "supersecret")  # nécessaire pour la session
+app.secret_key = os.environ.get("SECRET_KEY", "supersecret")
 scheduler = BackgroundScheduler()
 scheduler.start()
 
@@ -102,8 +102,16 @@ def rewrite_article(title: str, content: str) -> (str, str):
 def format_article(title_fr: str, content_fr: str) -> str:
     return f"{title_fr}\n\n{content_fr}\n\n— Arménie Info"
 
+# --- Feeds management ---
+def get_feeds():
+    """ Lit les flux RSS depuis feeds.txt, sinon fallback sur FEEDS. """
+    if os.path.exists("feeds.txt"):
+        with open("feeds.txt") as f:
+            return [line.strip() for line in f.readlines() if line.strip()]
+    return FEEDS
+
 def import_articles():
-    for feed_url in FEEDS:
+    for feed_url in get_feeds():
         feed = feedparser.parse(feed_url)
         for entry in feed.entries[:10]:
             link = entry.link
@@ -184,7 +192,6 @@ def feed():
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
     if "logged_in" in session and session["logged_in"]:
-        # utilisateur connecté → admin panel
         action = request.args.get("action")
         art_id = request.args.get("id")
 
@@ -211,7 +218,9 @@ def admin():
 
         html = """
         <h1>Admin Arménie Info</h1>
-        <a href="{{ url_for('admin', action='import') }}">Importer articles</a>
+        <a href="{{ url_for('admin', action='import') }}">Importer articles</a> |
+        <a href="{{ url_for('manage_feeds') }}">Configurer les flux RSS</a> |
+        <a href="{{ url_for('logout') }}">Se déconnecter</a>
         <ul>
         {% for id, title, status in rows %}
           <li>
@@ -221,11 +230,9 @@ def admin():
           </li>
         {% endfor %}
         </ul>
-        <a href="{{ url_for('logout') }}">Se déconnecter</a>
         """
         return render_template_string(html, rows=rows)
 
-    # si pas connecté → formulaire login
     if request.method == "POST":
         password = request.form.get("password")
         if password == ADMIN_PASS:
@@ -241,6 +248,34 @@ def admin():
         <button type="submit">Se connecter</button>
     </form>
     """
+
+@app.route("/feeds", methods=["GET", "POST"])
+def manage_feeds():
+    if "logged_in" not in session or not session["logged_in"]:
+        return redirect(url_for("admin"))
+
+    if request.method == "POST":
+        feeds_input = request.form.get("feeds")
+        feeds_list = [f.strip() for f in feeds_input.splitlines() if f.strip()]
+        with open("feeds.txt", "w") as f:
+            for feed in feeds_list:
+                f.write(feed + "\n")
+        return redirect(url_for("manage_feeds"))
+
+    feeds_list = []
+    if os.path.exists("feeds.txt"):
+        with open("feeds.txt") as f:
+            feeds_list = [line.strip() for line in f.readlines() if line.strip()]
+
+    html = """
+    <h1>Configurer les flux RSS</h1>
+    <form method="post">
+        <textarea name="feeds" rows="10" cols="60">{{ feeds_text }}</textarea><br>
+        <button type="submit">Sauvegarder</button>
+    </form>
+    <a href="{{ url_for('admin') }}">Retour admin</a>
+    """
+    return render_template_string(html, feeds_text="\n".join(feeds_list))
 
 @app.route("/logout")
 def logout():
