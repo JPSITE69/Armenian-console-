@@ -1,194 +1,43 @@
-# app.py
-from flask import Flask, request, redirect, url_for, Response, render_template_string, session, flash
-import os, sqlite3, hashlib, io, re, json, traceback
-from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse
-import requests, feedparser
-from bs4 import BeautifulSoup
-from PIL import Image, UnidentifiedImageError
-from apscheduler.schedulers.background import BackgroundScheduler
+def rewrite_article_fr(title_src: str, raw_text: str):
+    key, model = active_openai()
+    clean_input = strip_tags(raw_text or "")
+    if not clean_input:
+        return clean_title(title_src or "Actualité"), ensure_signature("(Contenu indisponible)")
+    if not key:
+        return clean_title(title_src or "Actualité"), ensure_signature(clean_input)
 
-# -------------------- CONFIG --------------------
-APP_NAME   = "Console Arménienne"
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "armenie")
-SECRET_KEY = os.environ.get("SECRET_KEY", "change-me")
-DB_PATH    = "site.db"
-
-DEFAULT_FEEDS = [
-    "https://www.civilnet.am/news/feed/",
-    "https://armenpress.am/rss/",
-    "https://news.am/eng/rss/",
-    "https://factor.am/feed",
-    "https://hetq.am/hy/rss",
-    "https://armenpress.am/hy/rss/articles",
-    "https://www.azatutyun.am/rssfeeds"
-]
-DEFAULT_MODEL = "gpt-4o-mini"
-
-# seuil images (permissif)
-IMG_MIN_W, IMG_MIN_H = 80, 80
-
-app = Flask(__name__)
-app.secret_key = SECRET_KEY
-
-# -------------------- DB --------------------
-def db():
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    return con
-
-def init_db():
-    con = db()
-    con.execute("""CREATE TABLE IF NOT EXISTS posts(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      title TEXT,
-      body  TEXT,
-      status TEXT DEFAULT 'draft',  -- draft | published
-      created_at TEXT,
-      updated_at TEXT,
-      publish_at TEXT,              -- "YYYY-MM-DDTHH:MM"
-      image_url TEXT,               -- chemin local /static/... ou URL absolue http(s)
-      image_sha1 TEXT,
-      orig_link TEXT UNIQUE
-    )""")
-    con.execute("""CREATE TABLE IF NOT EXISTS settings(
-      key TEXT PRIMARY KEY,
-      value TEXT
-    )""")
-    con.commit(); con.close()
-
-def get_setting(key, default=""):
-    con = db()
     try:
-        r = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-        return r["value"] if r else default
-    finally:
-        con.close()
-
-def set_setting(key, value):
-    con = db()
-    try:
-        con.execute(
-            "INSERT INTO settings(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
+        payload = {
+            "model": model,
+            "temperature": 0.3,
+            "messages": [
+                {"role": "system", "content":
+                 "Tu es un journaliste francophone. Réécris en FRANÇAIS : "
+                 "1) Première ligne = TITRE clair (sans le mot 'Titre'), "
+                 "2) Corps 150–220 mots, style info, sans HTML."},
+                {"role": "user", "content":
+                 f"Titre source: {title_src}\nTexte source: {clean_input}"}
+            ]
+        }
+        r = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=payload, timeout=60
         )
-        con.commit()
-    finally:
-        con.close()
+        j = r.json()
+        out = (j.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
 
-# -------------------- UTILS --------------------
-TAG_RE = re.compile(r"<[^>]+>")
+        # découper lignes
+        lines = [l.strip() for l in out.splitlines() if l.strip()]
+        ai_title = clean_title(lines[0])
+        ai_body  = "\n\n".join(lines[1:]) if len(lines) > 1 else clean_input
 
-def strip_tags(s: str) -> str:
-    return TAG_RE.sub("", s or "")
+        # assurer saut de ligne entre titre et contenu
+        body_text = f"{ai_title}\n\n{ai_body}"
+        body_text = ensure_signature(body_text)
 
-def clean_title(t: str) -> str:
-    t = strip_tags(t or "").strip()
-    t = re.sub(r'^(titre|title|headline)\s*[:\-–—]\s*', "", t, flags=re.I)
-    t = t.strip('«»"“”\'` ').strip()
-    if not t:
-        t = "Actualité"
-    return t[:1].upper() + t[1:]
+        return ai_title, body_text
 
-SIGN_REGEX = re.compile(r'(\s*[-–—]\s*Arménie\s+Info\s*)+$', re.I)
-
-def ensure_signature(text: str) -> str:
-    t = strip_tags(text or "").rstrip()
-    t = SIGN_REGEX.sub("", t).rstrip()
-    return (t + "\n\n- Arménie Info").strip()
-
-def http_get(url, timeout=25, headers=None):
-    h = {
-        "User-Agent": "Mozilla/5.0 (compatible; ArmInfo/1.0)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "fr,en;q=0.8",
-    }
-    if headers: h.update(headers)
-    r = requests.get(url, timeout=timeout, allow_redirects=True, headers=h)
-    r.raise_for_status()
-    r.encoding = r.encoding or "utf-8"
-    return r.text
-
-# --- sauver bytes -> image locale validée (taille mini) ---
-def _save_bytes_to_image(data: bytes):
-    sha1 = hashlib.sha1(data).hexdigest()
-    try:
-        im = Image.open(io.BytesIO(data))
-        im.verify()
-        im = Image.open(io.BytesIO(data))
-        w, h = im.size
-        if w < IMG_MIN_W or h < IMG_MIN_H:
-            return None, None
-    except (UnidentifiedImageError, Exception):
-        return None, None
-    os.makedirs("static/images", exist_ok=True)
-    path = f"static/images/{sha1}.jpg"
-    if not os.path.exists(path):
-        with open(path, "wb") as f:
-            f.write(data)
-    return "/" + path, sha1
-
-def download_image(url):
-    if not url:
-        return None, None
-    try:
-        r = requests.get(url, timeout=25, headers={"User-Agent":"Mozilla/5.0"})
-        r.raise_for_status()
-        return _save_bytes_to_image(r.content)
-    except Exception:
-        return None, None
-
-# ---- image par défaut (ta photo) ----
-def get_default_image():
-    p = get_setting("default_image_path", "").strip()
-    s = get_setting("default_image_sha1", "").strip()
-    return (p or None, s or None)
-
-def set_default_image_from_bytes(data: bytes):
-    p, s = _save_bytes_to_image(data)
-    if p and s:
-        set_setting("default_image_path", p)
-        set_setting("default_image_sha1", s)
-    return p, s
-
-def set_default_image_from_url(url: str):
-    p, s = download_image(url)
-    if p and s:
-        set_setting("default_image_path", p)
-        set_setting("default_image_sha1", s)
-    return p, s
-
-# -------------------- IMAGES : collecte permissive --------------------
-def _jsonld_image(soup, base):
-    for sc in soup.find_all("script", type=lambda v: v and "ld+json" in v):
-        try:
-            data = json.loads(sc.string or "{}")
-        except Exception:
-            continue
-        def pick(obj):
-            if isinstance(obj, str): return urljoin(base, obj)
-            if isinstance(obj, list) and obj: return pick(obj[0])
-            if isinstance(obj, dict):
-                return pick(obj.get("image") or obj.get("thumbnailUrl") or obj.get("url") or obj.get("@id") or obj.get("contentUrl"))
-            return None
-        if isinstance(data, list):
-            for item in data:
-                u = pick(item)
-                if u: return u
-        elif isinstance(data, dict):
-            u = pick(data)
-            if u: return u
-    return None
-
-def _extract_srcset(tag, base):
-    srcset = tag.get("srcset") or tag.get("data-srcset")
-    if not srcset:
-        return None
-    best_url, best_w = None, -1
-    for part in srcset.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        bits = part.split()
-        u = url
+    except Exception as e:
+        print("[AI] fail:", e)
+        return clean_title(title_src or "Actualité"), ensure_signature(clean_input)
