@@ -14,9 +14,8 @@ app.secret_key = os.getenv("SECRET_KEY", "secret")
 # Clés et variables
 ADMIN_PASS = os.getenv("ADMIN_PASS", "armenie")
 DB_PATH = os.getenv("DB_PATH", "console.db")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# Client OpenAI (nouvelle façon)
+# Client OpenAI (NE PAS PASSER la clé manuellement)
 client = OpenAI()
 
 # Création DB
@@ -46,8 +45,8 @@ def fetch_image_from_url(url):
         img = soup.find("img")
         if img and img.get("src"):
             return img["src"]
-    except Exception as e:
-        print("Erreur image:", e)
+    except:
+        pass
     return None
 
 def rewrite_article(title, content):
@@ -71,7 +70,7 @@ def rewrite_article(title, content):
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
         )
-        return response.choices[0].message["content"].strip()
+        return response.choices[0].message.content.strip()
     except Exception as e:
         return f"{title}\n\n{content}\n\nArménie Info (Erreur GPT : {e})"
 
