@@ -1,1 +1,19 @@
-gunicorn -w 1 -k gthread --threads 8 app:app
+services:
+- type: web
+  name: armenie-console
+  env: python
+  plan: free
+  buildCommand: "pip install -r requirements.txt"
+  startCommand: "gunicorn -w 1 -k gthread --threads 8 -b 0.0.0.0:$PORT app:app"
+  healthCheckPath: /health
+  envVars:
+    - key: SECRET_KEY
+      generateValue: true
+    - key: ADMIN_PASS
+      value: armenie   # change-le si tu veux
+    - key: DB_PATH
+      value: /var/data/armenien_console.db
+  disk:
+    name: data
+    mountPath: /var/data
+    sizeGB: 1
