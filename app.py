@@ -2,15 +2,14 @@ import os
 import sqlite3
 import requests
 import feedparser
-from flask import Flask, request, redirect, url_for, render_template_string, session
+from flask import Flask, request, redirect, url_for, render_template_string, session, flash
 from apscheduler.schedulers.background import BackgroundScheduler
 from bs4 import BeautifulSoup
 
-# ====== CONFIG ======
-APP_NAME      = "Console Arménienne"
-ADMIN_PASS    = os.environ.get("ADMIN_PASS", "armenie")
-SECRET_KEY    = os.environ.get("SECRET_KEY", "change-moi")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+# ===== CONFIG =====
+APP_NAME = "Console Arménienne"
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "armenie")
+SECRET_KEY = os.environ.get("SECRET_KEY", "change-moi")
 
 DB = "data.db"
 
@@ -26,20 +25,22 @@ FEEDS = [
     "https://www.azatutyun.am/rssfeeds",
 ]
 
-# ====== APP ======
+# ===== APP =====
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 
-# Santé pour Render
+
 @app.get("/health")
 def health():
     return "OK"
 
-# ====== DB ======
+
+# ===== DB =====
 def db():
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
     return con
+
 
 def init_db():
     con = db()
@@ -52,49 +53,67 @@ def init_db():
             published INTEGER DEFAULT 0
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     con.commit()
 
-# ====== IMAGE ======
+
+def get_setting(key, default=""):
+    con = db()
+    cur = con.execute("SELECT value FROM settings WHERE key=?", (key,))
+    row = cur.fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key, value):
+    con = db()
+    con.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (key, value))
+    con.commit()
+
+
+# ===== IMAGE =====
 def extract_image(entry):
-    # 1) <media:content>
     if "media_content" in entry and entry.media_content:
         url = entry.media_content[0].get("url")
-        if url: return url
-    # 2) liens image
+        if url:
+            return url
     if "links" in entry:
         for link in entry.links:
             if link.get("type", "").startswith("image/"):
                 return link.get("href")
-    # 3) image HTML dans summary
     if "summary" in entry:
         soup = BeautifulSoup(entry.summary, "html.parser")
         img = soup.find("img")
         if img and img.get("src"):
             return img["src"]
-    # 4) défaut
     return DEFAULT_IMAGE
 
-# ====== RÉÉCRITURE ======
+
+# ===== RÉÉCRITURE =====
 def rewrite_text(text: str) -> str:
-    """Réécrit en français (si clé OpenAI), sinon renvoie le texte tel quel.
-       Ajoute la signature UNE seule fois."""
+    """Réécrit en français avec OpenAI si dispo, sinon renvoie brut.
+    Ajoute la signature avec saut de ligne unique."""
     def _sign(t: str) -> str:
-        t = t.rstrip()
+        t = t.strip()
         if not t.endswith("– Arménie Info"):
-            t = f"{t}\n\n– Arménie Info"   # <<<< SAUT DE LIGNE AJOUTÉ ICI
+            t = f"{t}\n\n– Arménie Info"
         return t
 
-    if not OPENAI_API_KEY:
+    key = get_setting("openai_key", "")
+    if not key:
         return _sign(text)
 
     try:
-        # OpenAI (SDK v1 ou v0 compat — on reste simple)
         import openai
-        openai.api_key = OPENAI_API_KEY
+        openai.api_key = key
         resp = openai.ChatCompletion.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "Traduis et reformule en FR un court papier informatif, ton journalistique, sans balises HTML."},
+                {"role": "system", "content": "Réécris ce texte en français, style journalistique, sans HTML."},
                 {"role": "user", "content": text},
             ],
             temperature=0.4,
@@ -104,96 +123,127 @@ def rewrite_text(text: str) -> str:
     except Exception as e:
         return _sign(text + f"\n\n(Erreur traduction: {e})")
 
-# ====== IMPORT RSS ======
+
+# ===== IMPORT RSS =====
 def import_rss():
     con = db()
     cur = con.cursor()
     for url in FEEDS:
-        feed = feedparser.parse(url)
+        try:
+            feed = feedparser.parse(url)
+        except Exception as e:
+            print(f"[FEED] {url} error: {e}")
+            continue
+
         for entry in feed.entries:
             title = entry.get("title", "").strip() or "Sans titre"
-            raw   = entry.get("summary", "") or entry.get("description", "") or ""
+            raw = entry.get("summary", "") or entry.get("description", "") or ""
             image = extract_image(entry)
 
-            # dédup par titre
-            cur.execute("SELECT 1 FROM posts WHERE title = ?", (title,))
+            cur.execute("SELECT 1 FROM posts WHERE title=?", (title,))
             if cur.fetchone():
                 continue
 
             content = rewrite_text(raw)
-
             cur.execute(
                 "INSERT INTO posts (title, content, image, published) VALUES (?, ?, ?, 0)",
                 (title, content, image),
             )
     con.commit()
 
-# ====== ROUTES ======
+
+# ===== ROUTES =====
 @app.get("/")
 def index():
     con = db()
     posts = con.execute("SELECT * FROM posts WHERE published=1 ORDER BY id DESC").fetchall()
-    # Affichage propre : on convertit les \n en <br> pour garder le saut de ligne
     return render_template_string("""
-    <h1>{{ app_name }}</h1>
+    <h1>{{app_name}}</h1>
     {% for p in posts %}
       <article>
-        <h2>{{ p['title'] }}</h2>
-        {% if p['image'] %}<img src="{{ p['image'] }}" alt="" style="max-width:420px">{% endif %}
-        <p style="white-space:pre-line">{{ p['content'] }}</p>
+        <h2>{{p['title']}}</h2>
+        {% if p['image'] %}
+          <img src="{{p['image']}}" alt="" style="max-width:420px">
+        {% endif %}
+        <p style="white-space:pre-line">{{p['content']}}</p>
       </article>
       <hr>
     {% endfor %}
-    """, app_name=APP_NAME, posts=posts)
+    """, posts=posts, app_name=APP_NAME)
+
 
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
-    # login minimal
     if not session.get("admin"):
         if request.method == "POST" and request.form.get("password") == ADMIN_PASS:
             session["admin"] = True
             return redirect(url_for("admin"))
         return """
-        <h1>Admin</h1>
+        <h1>Connexion</h1>
         <form method="post">
           <input type="password" name="password" placeholder="Mot de passe" />
-          <button>Connexion</button>
+          <button>Entrer</button>
         </form>
         """
 
+    key = get_setting("openai_key", "")
+
     con = db()
     drafts = con.execute("SELECT * FROM posts WHERE published=0 ORDER BY id DESC").fetchall()
+    pubs = con.execute("SELECT * FROM posts WHERE published=1 ORDER BY id DESC").fetchall()
     return render_template_string("""
     <h1>Admin</h1>
+
+    <form method="post" action="{{ url_for('set_key') }}">
+      <label>OpenAI API Key :
+        <input type="password" name="key" value="{{key}}">
+      </label>
+      <button>Enregistrer</button>
+    </form>
 
     <form method="post" action="{{ url_for('import_now') }}">
       <button>🔁 Importer maintenant</button>
     </form>
     <br>
 
+    <h2>Brouillons</h2>
     {% for p in drafts %}
       <form method="post" action="{{ url_for('publish', pid=p['id']) }}">
-        <h3>{{ p['title'] }}</h3>
-        {% if p['image'] %}<img src="{{ p['image'] }}" alt="" style="max-width:300px"><br><br>{% endif %}
-        <textarea name="content" rows="8" cols="100">{{ p['content'] }}</textarea><br>
+        <h3>{{p['title']}}</h3>
+        {% if p['image'] %}<img src="{{p['image']}}" style="max-width:300px"><br>{% endif %}
+        <textarea name="content" rows="8" cols="100">{{p['content']}}</textarea><br>
         <button type="submit">Publier</button>
       </form>
       <hr>
     {% endfor %}
 
-    <p><a href="{{ url_for('index') }}">↩️ Accueil</a></p>
-    """, drafts=drafts)
+    <h2>Publiés</h2>
+    {% for p in pubs %}
+      <article>
+        <h3>{{p['title']}}</h3>
+      </article>
+    {% endfor %}
+    """, drafts=drafts, pubs=pubs, key=key)
+
+
+@app.post("/set-key")
+def set_key():
+    if not session.get("admin"):
+        return redirect(url_for("admin"))
+    key = request.form.get("key", "").strip()
+    set_setting("openai_key", key)
+    flash("Clé OpenAI enregistrée.")
+    return redirect(url_for("admin"))
+
 
 @app.route("/import-now", methods=["GET", "POST"])
 def import_now():
-    # accepte le clic bouton (POST) ou l'appel direct (GET)
     import_rss()
-    # message simple puis retour admin
     return redirect(url_for("admin"))
+
 
 @app.post("/publish/<int:pid>")
 def publish(pid):
-    # Nettoie/assure le saut de ligne + signature unique
     content = (request.form.get("content") or "").strip()
     if not content.endswith("– Arménie Info"):
         content = f"{content}\n\n– Arménie Info"
@@ -202,12 +252,13 @@ def publish(pid):
     con.commit()
     return redirect(url_for("index"))
 
-# ====== MAIN ======
+
+# ===== MAIN =====
 def start_scheduler():
-    # import automatique toutes les 3h (180 min) — stable et léger
     sched = BackgroundScheduler()
     sched.add_job(import_rss, "interval", minutes=180)
     sched.start()
+
 
 if __name__ == "__main__":
     init_db()
