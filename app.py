@@ -1,282 +1,249 @@
-import os
-import sqlite3
-import requests
-import feedparser
-from flask import Flask, request, redirect, url_for, render_template_string, session, flash, Response
-from apscheduler.schedulers.background import BackgroundScheduler
-from bs4 import BeautifulSoup
+# app.py
+from flask import Flask, request, redirect, url_for, Response, render_template_string, session, flash
+import os, sqlite3, hashlib, io, re, json, traceback
 from datetime import datetime, timezone
+from urllib.parse import urljoin, urlparse
+import requests, feedparser
+from bs4 import BeautifulSoup
+from PIL import Image, UnidentifiedImageError
+from apscheduler.schedulers.background import BackgroundScheduler
 
-# ===== CONFIG =====
-APP_NAME       = "Console Arménienne"
-ADMIN_PASS     = os.environ.get("ADMIN_PASS", "armenie")
-SECRET_KEY     = os.environ.get("SECRET_KEY", "change-moi")
-DB             = "data.db"
-DEFAULT_IMAGE  = "https://upload.wikimedia.org/wikipedia/commons/1/10/Flag_of_Armenia.png"
+# -------------------- CONFIG --------------------
+APP_NAME   = "Console Arménienne"
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "armenie")
+SECRET_KEY = os.environ.get("SECRET_KEY", "change-me")
+DB_PATH    = "site.db"
 
-FEEDS = [
+DEFAULT_FEEDS = [
     "https://www.civilnet.am/news/feed/",
     "https://armenpress.am/rss/",
     "https://news.am/eng/rss/",
     "https://factor.am/feed",
     "https://hetq.am/hy/rss",
     "https://armenpress.am/hy/rss/articles",
-    "https://www.azatutyun.am/rssfeeds",
+    "https://www.azatutyun.am/rssfeeds"
 ]
+DEFAULT_MODEL = "gpt-4o-mini"
+
+# seuil images (permissif)
+IMG_MIN_W, IMG_MIN_H = 80, 80
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 
-@app.get("/health")
-def health():
-    return "OK"
-
-# ===== DB =====
+# -------------------- DB --------------------
 def db():
-    con = sqlite3.connect(DB)
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
 
 def init_db():
     con = db()
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS posts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            content TEXT,
-            image TEXT,
-            published INTEGER DEFAULT 0,
-            created_at TEXT
-        )
-    """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-    con.commit()
+    con.execute("""CREATE TABLE IF NOT EXISTS posts(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT,
+      body  TEXT,
+      status TEXT DEFAULT 'draft',  -- draft | published
+      created_at TEXT,
+      updated_at TEXT,
+      publish_at TEXT,              -- "YYYY-MM-DDTHH:MM"
+      image_url TEXT,               -- chemin local /static/... ou URL absolue http(s)
+      image_sha1 TEXT,
+      orig_link TEXT UNIQUE
+    )""")
+    con.execute("""CREATE TABLE IF NOT EXISTS settings(
+      key TEXT PRIMARY KEY,
+      value TEXT
+    )""")
+    con.commit(); con.close()
 
 def get_setting(key, default=""):
     con = db()
-    r = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    return r["value"] if r else default
+    try:
+        r = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return r["value"] if r else default
+    finally:
+        con.close()
 
 def set_setting(key, value):
     con = db()
-    con.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (key, value))
-    con.commit()
-
-# ===== IMAGE =====
-def extract_image(entry):
-    if "media_content" in entry and entry.media_content:
-        u = entry.media_content[0].get("url")
-        if u: return u
-    if "links" in entry:
-        for link in entry.links:
-            if link.get("type", "").startswith("image/"):
-                return link.get("href")
-    html = entry.get("summary", "") or entry.get("description", "")
-    if html:
-        soup = BeautifulSoup(html, "html.parser")
-        img = soup.find("img")
-        if img and img.get("src"):
-            return img["src"]
-    return DEFAULT_IMAGE
-
-# ===== RÉÉCRITURE =====
-def rewrite_text(text: str) -> str:
-    def _sign(t: str) -> str:
-        t = t.strip()
-        if not t.endswith("– Arménie Info"):
-            t = f"{t}\n\n– Arménie Info"   # <<< SAUT DE LIGNE
-        return t
-
-    key = get_setting("openai_key", "")
-    if not key:
-        return _sign(text)
-
     try:
-        import openai
-        openai.api_key = key
-        resp = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Réécris ce texte en français clair, ton journalistique, sans HTML."},
-                {"role": "user", "content": text},
-            ],
-            temperature=0.4,
+        con.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
         )
-        out = resp.choices[0].message["content"].strip()
-        return _sign(out)
-    except Exception as e:
-        return _sign(text + f"\n\n(Erreur traduction: {e})")
+        con.commit()
+    finally:
+        con.close()
 
-# ===== IMPORT RSS =====
-def import_rss():
-    con = db()
-    cur = con.cursor()
-    for url in FEEDS:
+# -------------------- UTILS --------------------
+TAG_RE = re.compile(r"<[^>]+>")
+
+def strip_tags(s: str) -> str:
+    return TAG_RE.sub("", s or "")
+
+def clean_title(t: str) -> str:
+    t = strip_tags(t or "").strip()
+    t = re.sub(r'^(titre|title|headline)\s*[:\-–—]\s*', "", t, flags=re.I)
+    t = t.strip('«»"“”\'` ').strip()
+    if not t:
+        t = "Actualité"
+    return t[:1].upper() + t[1:]
+
+SIGN_REGEX = re.compile(r'(\s*[-–—]\s*Arménie\s+Info\s*)+$', re.I)
+
+def ensure_signature(text: str) -> str:
+    t = strip_tags(text or "").rstrip()
+    t = SIGN_REGEX.sub("", t).rstrip()
+    return (t + "\n\n- Arménie Info").strip()
+
+def http_get(url, timeout=25, headers=None):
+    h = {
+        "User-Agent": "Mozilla/5.0 (compatible; ArmInfo/1.0)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "fr,en;q=0.8",
+    }
+    if headers: h.update(headers)
+    r = requests.get(url, timeout=timeout, allow_redirects=True, headers=h)
+    r.raise_for_status()
+    r.encoding = r.encoding or "utf-8"
+    return r.text
+
+# --- sauver bytes -> image locale validée (taille mini) ---
+def _save_bytes_to_image(data: bytes):
+    sha1 = hashlib.sha1(data).hexdigest()
+    try:
+        im = Image.open(io.BytesIO(data))
+        im.verify()
+        im = Image.open(io.BytesIO(data))
+        w, h = im.size
+        if w < IMG_MIN_W or h < IMG_MIN_H:
+            return None, None
+    except (UnidentifiedImageError, Exception):
+        return None, None
+    os.makedirs("static/images", exist_ok=True)
+    path = f"static/images/{sha1}.jpg"
+    if not os.path.exists(path):
+        with open(path, "wb") as f:
+            f.write(data)
+    return "/" + path, sha1
+
+def download_image(url):
+    if not url:
+        return None, None
+    try:
+        r = requests.get(url, timeout=25, headers={"User-Agent":"Mozilla/5.0"})
+        r.raise_for_status()
+        return _save_bytes_to_image(r.content)
+    except Exception:
+        return None, None
+
+# ---- image par défaut (ta photo) ----
+def get_default_image():
+    p = get_setting("default_image_path", "").strip()
+    s = get_setting("default_image_sha1", "").strip()
+    return (p or None, s or None)
+
+def set_default_image_from_bytes(data: bytes):
+    p, s = _save_bytes_to_image(data)
+    if p and s:
+        set_setting("default_image_path", p)
+        set_setting("default_image_sha1", s)
+    return p, s
+
+def set_default_image_from_url(url: str):
+    p, s = download_image(url)
+    if p and s:
+        set_setting("default_image_path", p)
+        set_setting("default_image_sha1", s)
+    return p, s
+
+# -------------------- IMAGES : collecte permissive --------------------
+def _jsonld_image(soup, base):
+    for sc in soup.find_all("script", type=lambda v: v and "ld+json" in v):
         try:
-            feed = feedparser.parse(url)
-        except Exception as e:
-            print(f"[FEED] {url} error:", e)
+            data = json.loads(sc.string or "{}")
+        except Exception:
             continue
+        def pick(obj):
+            if isinstance(obj, str): return urljoin(base, obj)
+            if isinstance(obj, list) and obj: return pick(obj[0])
+            if isinstance(obj, dict):
+                return pick(obj.get("image") or obj.get("thumbnailUrl") or obj.get("url") or obj.get("@id") or obj.get("contentUrl"))
+            return None
+        if isinstance(data, list):
+            for item in data:
+                u = pick(item)
+                if u: return u
+        elif isinstance(data, dict):
+            u = pick(data)
+            if u: return u
+    return None
 
-        for entry in feed.entries:
-            title = (entry.get("title") or "").strip() or "Sans titre"
-            raw   = entry.get("summary", "") or entry.get("description", "") or ""
-            image = extract_image(entry)
+def _extract_srcset(tag, base):
+    srcset = tag.get("srcset") or tag.get("data-srcset")
+    if not srcset:
+        return None
+    best_url, best_w = None, -1
+    for part in srcset.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        bits = part.split()
+        u = urljoin(base, bits[0])
+        w = 0
+        if len(bits) > 1 and bits[1].endswith("w"):
+            try:
+                w = int(bits[1][:-1])
+            except:
+                w = 0
+        if w > best_w:
+            best_w, best_url = w, u
+    return best_url
 
-            cur.execute("SELECT 1 FROM posts WHERE title=?", (title,))
-            if cur.fetchone():
-                continue
+def image_candidates_from_html(html, base_url):
+    soup = BeautifulSoup(html, "html.parser")
+    cands = []
 
-            content = rewrite_text(raw)
-            now = datetime.now(timezone.utc).isoformat()
-            cur.execute(
-                "INSERT INTO posts (title, content, image, published, created_at) VALUES (?,?,?,?,?)",
-                (title, content, image, 0, now),
-            )
-    con.commit()
+    # 1) métadonnées
+    for sel, attr in [
+        ("meta[property='og:image:secure_url']", "content"),
+        ("meta[property='og:image']", "content"),
+        ("meta[name='twitter:image']", "content"),
+        ("meta[itemprop='image']", "content"),
+        ("link[rel='image_src']", "href"),
+    ]:
+        for m in soup.select(sel):
+            if m.get(attr): cands.append(urljoin(base_url, m[attr]))
 
-# ===== ROUTES =====
-@app.get("/")
-def index():
-    con = db()
-    posts = con.execute("SELECT * FROM posts WHERE published=1 ORDER BY id DESC").fetchall()
-    return render_template_string("""
-    <h1>{{app_name}}</h1>
-    {% for p in posts %}
-      <article>
-        <h2>{{p['title']}}</h2>
-        {% if p['image'] %}
-          <img src="{{p['image']}}" alt="" style="max-width:420px">
-        {% endif %}
-        <p style="white-space:pre-line">{{p['content']}}</p>
-      </article>
-      <hr>
-    {% endfor %}
-    """, app_name=APP_NAME, posts=posts)
+    # 2) JSON-LD
+    j = _jsonld_image(soup, base_url or "")
+    if j: cands.append(j)
 
-@app.route("/admin", methods=["GET", "POST"])
-def admin():
-    if not session.get("admin"):
-        if request.method == "POST" and request.form.get("password") == ADMIN_PASS:
-            session["admin"] = True
-            return redirect(url_for("admin"))
-        return """
-        <h1>Connexion</h1>
-        <form method="post">
-          <input type="password" name="password" placeholder="Mot de passe" />
-          <button>Entrer</button>
-        </form>
-        """
-
-    key = get_setting("openai_key", "")
-    con = db()
-    drafts = con.execute("SELECT * FROM posts WHERE published=0 ORDER BY id DESC").fetchall()
-    pubs   = con.execute("SELECT * FROM posts WHERE published=1 ORDER BY id DESC").fetchall()
-    return render_template_string("""
-    <h1>Admin</h1>
-
-    <form method="post" action="{{ url_for('set_key') }}">
-      <label>OpenAI API Key :
-        <input type="password" name="key" value="{{key}}">
-      </label>
-      <button>Enregistrer</button>
-    </form>
-
-    <form method="post" action="{{ url_for('import_now') }}">
-      <button>🔁 Importer maintenant</button>
-    </form>
-    <br>
-
-    <h2>Brouillons</h2>
-    {% for p in drafts %}
-      <form method="post" action="{{ url_for('publish', pid=p['id']) }}">
-        <h3>{{p['title']}}</h3>
-        {% if p['image'] %}<img src="{{p['image']}}" style="max-width:300px"><br>{% endif %}
-        <textarea name="content" rows="8" cols="100">{{p['content']}}</textarea><br>
-        <button type="submit">Publier</button>
-      </form>
-      <hr>
-    {% endfor %}
-
-    <h2>Publiés</h2>
-    {% for p in pubs %}
-      <article><h3>{{p['title']}}</h3></article>
-    {% endfor %}
-
-    <p>Flux RSS : <a href="{{ url_for('rss') }}">{{ request.url_root.rstrip('/') + url_for('rss') }}</a></p>
-    """, drafts=drafts, pubs=pubs, key=key)
-
-@app.post("/set-key")
-def set_key():
-    if not session.get("admin"):
-        return redirect(url_for("admin"))
-    key = (request.form.get("key") or "").strip()
-    set_setting("openai_key", key)
-    flash("Clé OpenAI enregistrée.")
-    return redirect(url_for("admin"))
-
-@app.route("/import-now", methods=["GET", "POST"])
-def import_now():
-    import_rss()
-    return redirect(url_for("admin"))
-
-@app.post("/publish/<int:pid>")
-def publish(pid):
-    content = (request.form.get("content") or "").strip()
-    if not content.endswith("– Arménie Info"):
-        content = f"{content}\n\n– Arménie Info"   # <<< SAUT DE LIGNE
-    con = db()
-    con.execute("UPDATE posts SET content=?, published=1 WHERE id=?", (content, pid))
-    con.commit()
-    return redirect(url_for("index"))
-
-@app.get("/rss.xml")
-def rss():
-    con = db()
-    rows = con.execute("SELECT * FROM posts WHERE published=1 ORDER BY id DESC LIMIT 100").fetchall()
-    items = []
-    for r in rows:
-        title = (r["title"] or "").replace("&", "&amp;")
-        desc  = (r["content"] or "")
-        desc_cdata = f"<![CDATA[{desc}]]>"
-        enclosure = ""
-        if r["image"]:
-            enclosure = f"<enclosure url=\"{r['image']}\" type=\"image/jpeg\"/>"
-        pubdate = datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S %z')
-        items.append(
-            f"<item>"
-            f"<title>{title}</title>"
-            f"<link>{request.url_root}</link>"
-            f"<guid isPermaLink=\"false\">{r['id']}</guid>"
-            f"<description>{desc_cdata}</description>"
-            f"{enclosure}"
-            f"<pubDate>{pubdate}</pubDate>"
-            f"</item>"
-        )
-    rss_xml = (
-        "<?xml version='1.0' encoding='UTF-8'?>"
-        "<rss version='2.0'>"
-        "<channel>"
-        f"<title>{APP_NAME} — Flux</title>"
-        f"<link>{request.url_root}</link>"
-        "<description>Articles publiés</description>"
-        + "".join(items) +
-        "</channel></rss>"
+    # 3) images dans le contenu
+    roots = soup.select(
+        "article, .entry-content, .post-content, .article-content, "
+        ".content-article, .article-body, #article-body, .single-content, .content"
     )
-    return Response(rss_xml, mimetype="application/rss+xml")
+    if not roots:
+        roots = [soup]
+    for root in roots:
+        for imgtag in root.find_all(["img","amp-img","picture","figure"]):
+            if imgtag.name in ("img","amp-img"):
+                u = imgtag.get("src") or imgtag.get("data-src") or imgtag.get("data-original")
+                if not u:
+                    u = _extract_srcset(imgtag, base_url)
+                if u:
+                    cands.append(urljoin(base_url, u))
+            else:
+                im = imgtag.find("img")
+                if im:
+                    u = im.get("src") or im.get("data-src") or im.get("data-original") or _extract_srcset(im, base_url)
+                    if u: cands.append(urljoin(base_url, u))
 
-# ===== MAIN =====
-def start_scheduler():
-    sched = BackgroundScheduler()
-    sched.add_job(import_rss, "interval", minutes=180)
-    sched.start()
-
-if __name__ == "__main__":
-    init_db()
-    start_scheduler()
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    # dédup
+    seen, uniq = set(), []
+    for u in cands:
+        if u not in seen:
+            seen.add
