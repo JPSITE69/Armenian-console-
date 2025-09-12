@@ -1,17 +1,7 @@
-services:
-  - type: web
-    name: armenie-console
-    env: python
-    plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn -w 3 -k gthread --threads 8 -b 0.0.0.0:$PORT app:app"
-    envVars:
-      - key: SECRET_KEY
-        generateValue: true
-      - key: ADMIN_PASS
-        value: armenie
-      - key: DB_PATH
-        value: console.db
-      - key: OPENAI_API_KEY
-        sync: false   # valeur vide ici
-    healthCheckPath: /health
+flask==3.0.3
+gunicorn==22.0.0
+requests==2.32.3
+feedparser==6.0.11
+beautifulsoup4==4.12.3
+lxml==5.2.1
+openai>=1.40.0
