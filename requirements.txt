@@ -8,3 +8,4 @@ openai>=1.52.0
 Pillow==10.4.0
 langdetect==1.0.9
 pytz==2024.1
+Werkzeug==2.2.3
