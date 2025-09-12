@@ -9,6 +9,6 @@ services:
       - key: SECRET_KEY
         generateValue: true
       - key: ADMIN_PASS
-        value: armenie        # change si tu veux
+        value: armenie         # tu peux changer ce mot de passe admin
       - key: OPENAI_API_KEY
-        sync: false           # à saisir ensuite dans Render > Settings > Environment
+        sync: false            # tu ajoutes ta clé dans Render > Settings > Environment
