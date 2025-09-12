@@ -7,19 +7,19 @@ from flask import Flask, request, redirect, url_for, session
 from openai import OpenAI
 from datetime import datetime
 
-# Initialisation de Flask
+# --- Initialisation Flask ---
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "secret")
 
-# Clés et variables
+# --- Variables ---
 ADMIN_PASS = os.getenv("ADMIN_PASS", "armenie")
 DB_PATH = os.getenv("DB_PATH", "console.db")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# Client OpenAI
+# --- Client OpenAI ---
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Création DB
+# --- Création DB ---
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -29,31 +29,30 @@ def init_db():
                   content TEXT,
                   image TEXT,
                   status TEXT,
+                  publish_at TEXT,
                   created_at TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS settings
-                 (key TEXT PRIMARY KEY, value TEXT)''')
     conn.commit()
     conn.close()
 
 init_db()
 
-# --- Fonctions utiles ---
+# --- Utilitaires ---
 def fetch_image_from_url(url):
-    """Récupère la première image d’un article si possible"""
+    """Récupère la première image trouvée sur un article"""
     try:
         r = requests.get(url, timeout=5)
         soup = BeautifulSoup(r.text, "html.parser")
         img = soup.find("img")
         if img and img.get("src"):
             return img["src"]
-    except Exception as e:
-        print(f"[ERREUR IMAGE] {e}")
+    except:
+        pass
     return None
 
 def rewrite_article(title, content):
-    """Réécriture avec GPT et mise en page"""
+    """Traduction + réécriture via OpenAI"""
     if not OPENAI_API_KEY:
-        return f"{title}\n\n{content}\n\nArménie Info (⚠️ Pas de clé API OpenAI configurée)"
+        return f"{title}\n\n{content}\n\n(⚠️ Pas de clé API définie)"
 
     try:
         prompt = f"""
@@ -63,9 +62,7 @@ def rewrite_article(title, content):
 
         Format attendu :
         - Titre traduit
-        - Saut de ligne
         - Contenu réécrit en français clair
-        - Saut de ligne
         - Signature : Arménie Info
         """
 
@@ -76,31 +73,33 @@ def rewrite_article(title, content):
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        return f"{title}\n\n{content}\n\nArménie Info (Erreur GPT : {e})"
+        return f"{title}\n\n{content}\n\n(Erreur GPT : {e})"
 
-def save_article(title, content, image, status="draft"):
+def save_article(title, content, image, status="draft", publish_at=None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT INTO articles (title, content, image, status, created_at) VALUES (?, ?, ?, ?, ?)",
-              (title, content, image, status, datetime.now().isoformat()))
+    c.execute("INSERT INTO articles (title, content, image, status, publish_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+              (title, content, image, status, publish_at, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
-# --- Routes principales ---
+# --- Routes publiques ---
 @app.route("/")
 def index():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT id, title, content, image FROM articles WHERE status='published' ORDER BY created_at DESC")
+    c.execute("SELECT id, title, content, image, publish_at FROM articles WHERE status='published' ORDER BY created_at DESC")
     articles = c.fetchall()
     conn.close()
 
     html = "<h1>Arménie Info</h1>"
     for a in articles:
         img_html = f"<img src='{a[3]}' width='300'><br>" if a[3] else ""
-        html += f"<h2>{a[1]}</h2>{img_html}<p>{a[2]}</p><hr>"
+        date_html = f"<em>📅 {a[4]}</em><br>" if a[4] else ""
+        html += f"<h2>{a[1]}</h2>{date_html}{img_html}<p>{a[2]}</p><hr>"
     return html
 
+# --- Admin ---
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
     if "logged_in" not in session:
@@ -111,37 +110,33 @@ def admin():
 
     action = request.args.get("action")
 
-    # --- Import d'articles ---
+    # Importation des articles
     if action == "import":
-        feeds = get_feeds()
+        feeds = [
+            "https://www.civilnet.am/feed/",
+            "https://armtimes.com/hy/rss",
+            "https://civic.am/feed/"
+        ]
         for feed_url in feeds:
-            try:
-                feed = feedparser.parse(feed_url)
-                for entry in feed.entries[:5]:
-                    try:
-                        content = entry.get("summary", "") or entry.get("description", "")
-                        image = fetch_image_from_url(entry.link) or get_default_image()
-                        rewritten = rewrite_article(entry.title, content)
-                        save_article(entry.title, rewritten, image)
-                    except Exception as e:
-                        print(f"[ERREUR ARTICLE] {e}")
-                        continue
-            except Exception as e:
-                print(f"[ERREUR FLUX] {feed_url} : {e}")
-                continue
+            feed = feedparser.parse(feed_url)
+            for entry in feed.entries[:5]:
+                image = fetch_image_from_url(entry.link)
+                rewritten = rewrite_article(entry.title, entry.get("summary", ""))
+                save_article(entry.title, rewritten, image)
         return redirect(url_for("admin"))
 
-    # --- Publier ---
+    # Publication
     if action == "publish":
         aid = request.args.get("id")
+        publish_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("UPDATE articles SET status='published' WHERE id=?", (aid,))
+        c.execute("UPDATE articles SET status='published', publish_at=? WHERE id=?", (publish_date, aid))
         conn.commit()
         conn.close()
         return redirect(url_for("admin"))
 
-    # --- Supprimer ---
+    # Suppression
     if action == "delete":
         aid = request.args.get("id")
         conn = sqlite3.connect(DB_PATH)
@@ -151,83 +146,63 @@ def admin():
         conn.close()
         return redirect(url_for("admin"))
 
+    # Edition
+    if action == "edit":
+        aid = request.args.get("id")
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT id, title, content, image, publish_at FROM articles WHERE id=?", (aid,))
+        art = c.fetchone()
+        conn.close()
+
+        if request.method == "POST":
+            new_title = request.form["title"]
+            new_content = request.form["content"]
+            new_image = request.form["image"]
+            new_publish_at = request.form["publish_at"]
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("UPDATE articles SET title=?, content=?, image=?, publish_at=? WHERE id=?",
+                      (new_title, new_content, new_image, new_publish_at, aid))
+            conn.commit()
+            conn.close()
+            return redirect(url_for("admin"))
+
+        return f"""
+        <h2>Modifier article</h2>
+        <form method="post">
+          Titre : <input type="text" name="title" value="{art[1]}"><br>
+          Contenu : <textarea name="content" rows="10" cols="60">{art[2]}</textarea><br>
+          Image URL : <input type="text" name="image" value="{art[3]}"><br>
+          Publier à (YYYY-MM-DD HH:MM:SS) : <input type="text" name="publish_at" value="{art[4] or ''}"><br>
+          <input type="submit" value="Enregistrer">
+        </form>
+        """
+
+    # Liste des articles
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT id, title, status FROM articles ORDER BY created_at DESC")
+    c.execute("SELECT id, title, status, publish_at FROM articles ORDER BY created_at DESC")
     articles = c.fetchall()
     conn.close()
 
     html = "<h1>Admin Arménie Info</h1>"
     html += "<a href='?action=import'>📥 Importer articles</a> | "
-    html += "<a href='/feeds'>⚙️ Configurer flux RSS</a> | "
-    html += "<a href='/settings'>🖼 Paramètres</a> | "
     html += "<a href='/logout'>🚪 Déconnexion</a><hr>"
 
     for a in articles:
-        html += f"[{a[2]}] {a[1]} - <a href='?action=publish&id={a[0]}'>Publier</a> | <a href='?action=delete&id={a[0]}'>Supprimer</a><br>"
+        html += f"[{a[2]}] {a[1]} ({a[3] or '—'}) - "
+        html += f"<a href='?action=publish&id={a[0]}'>Publier</a> | "
+        html += f"<a href='?action=edit&id={a[0]}'>Modifier</a> | "
+        html += f"<a href='?action=delete&id={a[0]}'>Supprimer</a><br>"
     return html
-
-@app.route("/feeds", methods=["GET", "POST"])
-def feeds():
-    if "logged_in" not in session:
-        return redirect(url_for("admin"))
-    if request.method == "POST":
-        save_setting("feeds", request.form["feeds"])
-        return redirect(url_for("feeds"))
-    feeds = get_feeds()
-    return f"<h2>Configurer les flux RSS</h2><form method='post'><textarea name='feeds' rows='5' cols='60'>{chr(10).join(feeds)}</textarea><br><input type='submit' value='Sauvegarder'></form><br><a href='/admin'>Retour admin</a>"
-
-@app.route("/settings", methods=["GET", "POST"])
-def settings():
-    if "logged_in" not in session:
-        return redirect(url_for("admin"))
-    if request.method == "POST":
-        save_setting("default_image", request.form["default_image"])
-        return redirect(url_for("settings"))
-    return f"<h2>Paramètres</h2><form method='post'>Image par défaut : <input type='text' name='default_image' value='{get_default_image()}' size='50'><input type='submit' value='Sauvegarder'></form><br><a href='/admin'>Retour admin</a>"
 
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect(url_for("admin"))
 
-@app.route("/feed.xml")
-def rss():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT title, content, created_at FROM articles WHERE status='published' ORDER BY created_at DESC")
-    articles = c.fetchall()
-    conn.close()
-
-    rss = '<?xml version="1.0"?><rss version="2.0"><channel><title>Arménie Info</title>'
-    for a in articles:
-        rss += f"<item><title>{a[0]}</title><description><![CDATA[{a[1]}]]></description><pubDate>{a[2]}</pubDate></item>"
-    rss += "</channel></rss>"
-    return rss, {"Content-Type": "application/rss+xml"}
-
-# --- Gestion des paramètres ---
-def save_setting(key, value):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
-    conn.commit()
-    conn.close()
-
-def get_setting(key, default=""):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT value FROM settings WHERE key=?", (key,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else default
-
-def get_feeds():
-    return get_setting("feeds", "").splitlines()
-
-def get_default_image():
-    return get_setting("default_image", "")
-
-# --- Santé ---
+# --- Healthcheck ---
 @app.route("/health")
 def health():
     return "OK"
