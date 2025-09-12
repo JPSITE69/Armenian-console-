@@ -2,11 +2,11 @@ import os
 import sqlite3
 import feedparser
 import requests
-from flask import Flask, request, redirect, url_for, render_template_string, Response, abort
+from flask import Flask, request, redirect, url_for, render_template_string, Response, abort, session
 from bs4 import BeautifulSoup
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
-import openai  # ✅ nouvelle manière d'utiliser OpenAI
+import openai
 
 # --- Config ---
 DB_PATH = os.environ.get("DB_PATH", "console.db")
@@ -15,9 +15,10 @@ DEFAULT_IMAGE = os.environ.get("DEFAULT_IMAGE", "https://placehold.co/600x400?te
 FEEDS = eval(os.environ.get("FEEDS", "[]"))  # liste JSON de flux
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-openai.api_key = OPENAI_API_KEY  # ✅ correcte pour openai>=1.0
+openai.api_key = OPENAI_API_KEY
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "supersecret")  # nécessaire pour la session
 scheduler = BackgroundScheduler()
 scheduler.start()
 
@@ -72,10 +73,7 @@ def get_image_from_page(url: str, default_image: str = DEFAULT_IMAGE) -> str:
     return default_image
 
 def rewrite_article(title: str, content: str) -> (str, str):
-    """
-    Utilise GPT pour traduire + réécrire un article.
-    Retourne (titre_fr, contenu_fr).
-    """
+    """ Utilise GPT pour traduire + réécrire un article. """
     if not OPENAI_API_KEY:
         return title, content
 
@@ -135,7 +133,7 @@ def import_articles():
             conn.commit()
             conn.close()
 
-# --- Routes ---
+# --- Routes publiques ---
 @app.route("/")
 def home():
     conn = sqlite3.connect(DB_PATH)
@@ -182,50 +180,72 @@ def feed():
     </rss>"""
     return Response(rss, mimetype="application/xml")
 
+# --- Admin avec login ---
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
-    password = request.args.get("password")
-    if password != ADMIN_PASS:
-        return abort(403)
+    if "logged_in" in session and session["logged_in"]:
+        # utilisateur connecté → admin panel
+        action = request.args.get("action")
+        art_id = request.args.get("id")
 
-    action = request.args.get("action")
-    art_id = request.args.get("id")
+        if action == "import":
+            import_articles()
+        elif action == "publish" and art_id:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute("UPDATE articles SET status='published' WHERE id=?", (art_id,))
+            conn.commit()
+            conn.close()
+        elif action == "delete" and art_id:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute("DELETE FROM articles WHERE id=?", (art_id,))
+            conn.commit()
+            conn.close()
 
-    if action == "import":
-        import_articles()
-    elif action == "publish" and art_id:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute("UPDATE articles SET status='published' WHERE id=?", (art_id,))
-        conn.commit()
-        conn.close()
-    elif action == "delete" and art_id:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("DELETE FROM articles WHERE id=?", (art_id,))
-        conn.commit()
+        cur.execute("SELECT id, title, status FROM articles ORDER BY id DESC")
+        rows = cur.fetchall()
         conn.close()
 
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT id, title, status FROM articles ORDER BY id DESC")
-    rows = cur.fetchall()
-    conn.close()
+        html = """
+        <h1>Admin Arménie Info</h1>
+        <a href="{{ url_for('admin', action='import') }}">Importer articles</a>
+        <ul>
+        {% for id, title, status in rows %}
+          <li>
+            <b>[{{ status }}]</b> {{ title }}
+            <a href="{{ url_for('admin', action='publish', id=id) }}">Publier</a>
+            <a href="{{ url_for('admin', action='delete', id=id) }}">Supprimer</a>
+          </li>
+        {% endfor %}
+        </ul>
+        <a href="{{ url_for('logout') }}">Se déconnecter</a>
+        """
+        return render_template_string(html, rows=rows)
 
-    html = """
-    <h1>Admin Arménie Info</h1>
-    <a href="{{ url_for('admin', password=password, action='import') }}">Importer articles</a>
-    <ul>
-    {% for id, title, status in rows %}
-      <li>
-        <b>[{{ status }}]</b> {{ title }}
-        <a href="{{ url_for('admin', password=password, action='publish', id=id) }}">Publier</a>
-        <a href="{{ url_for('admin', password=password, action='delete', id=id) }}">Supprimer</a>
-      </li>
-    {% endfor %}
-    </ul>
+    # si pas connecté → formulaire login
+    if request.method == "POST":
+        password = request.form.get("password")
+        if password == ADMIN_PASS:
+            session["logged_in"] = True
+            return redirect(url_for("admin"))
+        else:
+            return "Mot de passe incorrect", 403
+
+    return """
+    <h1>Connexion Admin</h1>
+    <form method="post">
+        <input type="password" name="password" placeholder="Mot de passe"/>
+        <button type="submit">Se connecter</button>
+    </form>
     """
-    return render_template_string(html, rows=rows, password=password)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("admin"))
 
 @app.route("/health")
 def health():
