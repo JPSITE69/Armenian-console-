@@ -213,67 +213,43 @@ def rewrite_article_fr(title_src: str, raw_text: str):
     key, model = active_openai()
     clean_input = strip_tags(raw_text)
 
-    ddef call_openai():
-    prompt = (
-        "Tu es journaliste pour Arménie Info.\n"
-        "Objectif : traduire/réécrire EN FRANÇAIS dans un style journalistique clair, concis et factuel.\n"
-        "Contraintes de mise en page :\n"
-        "1) Titre journalistique concis (max 90 caractères, sans point final).\n"
-        "2) Corps de 180–260 mots en 3–5 paragraphes courts, séparés par une LIGNE VIDE.\n"
-        "3) Pas de balises HTML, pas de listes, pas d'émojis.\n"
-        "4) Conserver chiffres, dates, noms propres et citations factuelles (ne rien inventer).\n"
-        "5) Terminer STRICTEMENT par : - Arménie Info\n"
-        "Format de sortie STRICT : JSON {\"title\":\"...\",\"body\":\"...\"}\n\n"
-        f"Titre (source) : {title_src}\n"
-        f"Texte (source) : {clean_input}"
-    )
-
-    payload = {
-        "model": model or "gpt-4o-mini",
-        "temperature": 0.2,
-        "messages": [
-            {
-                "role": "system",
-                "content": "Tu écris en français journalistique, style Arménie Info : clair, concis, factuel. Réponds uniquement en JSON."
-            },
-            {"role": "user", "content": prompt}
-        ]
-    }
-
-    r = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json=payload, timeout=60
-    )
-    j = r.json()
-    out = (j.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
-
-    # Lecture du JSON (fallback si besoin)
-    try:
-        data = _json.loads(out)
-        title_fr = strip_tags(data.get("title", "")).strip()
-        body_fr  = strip_tags(data.get("body", "")).strip()
-    except Exception:
-        parts = out.split("\n", 1)
-        title_fr = strip_tags(parts[0]).strip()
-        body_fr  = strip_tags(parts[1] if len(parts) > 1 else "").strip()
-
-    # Normalisation du titre
-    title_fr = re.sub(r"\s+", " ", title_fr).strip()
-    if title_fr.endswith("."):
-        title_fr = title_fr[:-1].rstrip()
-    if len(title_fr) > 90:
-        title_fr = title_fr[:90].rstrip(" ,;:")
-
-    # Paragraphes propres + signature unique
-    paras = [p.strip() for p in re.split(r"\r?\n\r?\n|(?:\r?\n){1,}", body_fr) if p.strip()]
-    body_fr = "\n\n".join(paras)
-    body_fr = ensure_signature(body_fr)
-
-    if not title_fr:
-        title_fr = _title_from_text_fallback(body_fr)
-
-    return title_fr, body_fr
+    def call_openai():
+        prompt = (
+            "Tu es un journaliste francophone. "
+            "Traduis et réécris en FRANÇAIS le Titre et le Corps de l'article ci-dessous. "
+            "Style neutre, informatif. 150–220 mots pour le corps. "
+            "RENVOIE UNIQUEMENT du JSON avec les clés 'title' et 'body'. "
+            "Le 'body' doit être du TEXTE BRUT (pas de balises) et DOIT se terminer par: - Arménie Info.\n\n"
+            f"Titre (source): {title_src}\n"
+            f"Texte (source): {clean_input}"
+        )
+        payload = {
+            "model": model or "gpt-4o-mini",
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": "Tu écris en français clair et concis. Réponds uniquement au format demandé."},
+                {"role": "user", "content": prompt}
+            ]
+        }
+        r = requests.post("https://api.openai.com/v1/chat/completions",
+                          headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                          json=payload, timeout=60)
+        j = r.json()
+        out = (j.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+        try:
+            data = _json.loads(out)
+            title_fr = strip_tags(data.get("title","")).strip()
+            body_fr  = strip_tags(data.get("body","")).strip()
+        except Exception:
+            parts = out.split("\n", 1)
+            title_fr = strip_tags(parts[0]).strip()
+            body_fr  = strip_tags(parts[1] if len(parts) > 1 else "").strip()
+        if not body_fr:
+            body_fr = " ".join(clean_input.split()[:220]).strip()
+        body_fr = ensure_signature(body_fr)
+        if not title_fr:
+            title_fr = _title_from_text_fallback(body_fr)
+        return title_fr, body_fr
 
     if key:
         try:
