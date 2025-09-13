@@ -9,6 +9,7 @@ from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 import feedparser
 from PIL import Image, UnidentifiedImageError
+from render_visual import render_visual
 
 # ================== CONFIG ==================
 APP_NAME   = "Console Arménienne"
@@ -912,12 +913,28 @@ def import_now_get():
     flash("Utilise les boutons d’import dans l’admin.")
     return redirect(url_for("admin"))
 
+
 @app.post("/save/<int:post_id>")
 def save(post_id):
     if not session.get("ok"): return redirect(url_for("admin"))
-    action     = request.form.get("action","save")
-    title      = strip_tags(request.form.get("title","").strip())
-    body       = strip_tags(request.form.get("body","").strip())
+    action = request.form.get("action","save")
+    title  = strip_tags(request.form.get("title","").strip())
+    body   = strip_tags(request.form.get("body","").strip())
+      # --- Visuel brandé : remplacer la photo brute par le template ---
+    image_url = (request.form.get("image_url", "") or get_setting("default_image_url","")).strip()
+
+    slug = re.sub(r"[^a-zA-Z0-9\-]+", "-", (title or str(post_id))).strip("-").lower() or f"post-{post_id}"
+
+    out_path = render_visual(
+        template_path="static/templates/news_template.jpg",
+        photo_src=image_url,
+        title=title,
+        out_path=f"static/renders/{slug}.jpg",
+        photo_ratio_top=0.60, band_left=0.08, band_right=0.92,
+        min_px=40, max_px=80, max_lines=4
+    )
+    image_url = out_path
+    # ----------------------------------------------------------------
     publish_at = request.form.get("publish_at","").strip()
 
     if body:
