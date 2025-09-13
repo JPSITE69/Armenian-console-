@@ -1,5 +1,5 @@
 # app.py
-from flask import Flask, request, redirect, url_for, Response, render_template_string, session, flash
+from flask import Flask, request, redirect, url_for, Response, render_template_string, session, flash, jsonify
 import sqlite3, os, hashlib, io, traceback, re, threading, time, json as _json
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
@@ -14,19 +14,20 @@ ADMIN_PASS = os.environ.get("ADMIN_PASS", "armenie")
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me")
 DB_PATH    = "site.db"
 
-# ---- RSS par défaut (tu peux changer dans /admin)
+# Limites par défaut (modifiables dans l'admin)
+DEFAULT_RSS_LIMIT_PER_FEED   = 12
+DEFAULT_SCRAPE_LIMIT_PER_SITE = 7
+
+# ---- RSS par défaut
 DEFAULT_FEEDS = [
     "https://www.civilnet.am/news/feed/",
     "https://armenpress.am/rss/",
     "https://news.am/eng/rss/",
     "https://factor.am/feed",
     "https://hetq.am/hy/rss",
-    # Ajoute tes Google News ici si tu veux
-    # "https://news.google.com/rss/search?q=Arm%C3%A9nie&hl=fr&gl=FR&ceid=FR:fr",
 ]
 
 # ---- Scrapers d'index par défaut (éditables dans /admin)
-# Note: tu peux augmenter "max_items" dans l'admin ou par site ici.
 DEFAULT_SCRAPERS = [
     {
         "name": "CivilNet",
@@ -99,42 +100,47 @@ DEFAULT_SCRAPERS = [
         "max_items": 7
     },
     {
-        "name": "Civic.am",
-        "index_url": "https://www.civic.am/",
-        "link_selector": "article a, h2 a, .post-title a",
-        "title_selector": "h1, .post-title h1",
-        "content_selector": "article, .entry-content, .post-content",
-        "image_selectors": [
-            "meta[property='og:image']::content",
-            "meta[name='twitter:image']::content",
-            "article img::src",
-            "img::src"
-        ],
-        "max_items": 7
-    },
-    {
         "name": "ArmTimes (HY)",
         "index_url": "https://www.armtimes.com/hy",
-        "link_selector": "a[href*='/hy/article/'], .news-list a, article a",
+        "link_selector": "a[href*='/hy/article/'], .list a",
         "title_selector": "h1",
-        "content_selector": "article, .content-article, .article-content",
+        "content_selector": "article, .article-content, .content",
         "image_selectors": [
             "meta[property='og:image']::content",
             "meta[name='twitter:image']::content",
             "article img::src",
             "img::src"
         ],
-        "max_items": 7
-    }
+        "max_items": 6
+    },
+    {
+        "name": "Civic.am",
+        "index_url": "https://civic.am/",
+        "link_selector": "article a, .post a, a[href*='/news/']",
+        "title_selector": "h1, .post-title h1",
+        "content_selector": "article, .post-content, .entry-content",
+        "image_selectors": [
+            "meta[property='og:image']::content",
+            "meta[name='twitter:image']::content",
+            "article img::src",
+            "img::src"
+        ],
+        "max_items": 6
+    },
 ]
 
-# ---- Limites par défaut (modifiables dans l'admin)
-DEFAULT_RSS_LIMIT = 20
-DEFAULT_SCRAPER_LIMIT = 7
+# OpenAI via ENV (écrasé par les paramètres admin si saisis)
+ENV_OPENAI_KEY   = os.environ.get("OPENAI_API_KEY", "").strip()
+ENV_OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
 
-# ---- OpenAI via ENV (prioritaire) ou via /admin si ENV absente
-ENV_OPENAI_KEY   = (os.environ.get("OPENAI_API_KEY", "") or "").strip()
-ENV_OPENAI_MODEL = (os.environ.get("OPENAI_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip()
+# Prompt de style "Arménie Info"
+JOURNO_STYLE = (
+    "Tu es journaliste pour Arménie Info. Écris en FRANÇAIS, neutre et factuel, clair et court. "
+    "Structure l'article en 2 à 3 paragraphes, 150 à 220 mots au total. "
+    "Titre bref et informatif (pas de clickbait). "
+    "Évite les listes, pas de HTML, pas de balises. "
+    "Termine le corps strictement par : - Arménie Info"
+)
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -204,32 +210,10 @@ def looks_french(text: str) -> bool:
     hits = sum(1 for w in words[:80] if w in FR_TOKENS)
     return hits >= 5
 
-def ensure_signature(body: str) -> str:
-    b = (body or "").rstrip()
-    # retire une éventuelle signature déjà présente pour éviter doublon
-    b = re.sub(r'\s*[-–]\s*Arménie Info\s*$', '', b).strip()
-    if not b.endswith("- Arménie Info"):
-        b += "\n\n- Arménie Info"
-    return b
-
-BODY_MAX_WORDS = 220  # plafond strict (hors signature)
-
-def trim_to_words(text: str, n: int = BODY_MAX_WORDS) -> str:
-    words = (text or "").split()
-    if len(words) <= n:
-        return (text or "").strip()
-    return " ".join(words[:n]).rstrip(".,;:!?)").strip()
-
 def active_openai():
-    """
-    Priorité à la variable d'environnement si présente (pour éviter de retaper),
-    sinon on prend la valeur stockée en base via l'admin.
-    """
-    key_from_db   = get_setting("openai_key", "").strip()
-    model_from_db = get_setting("openai_model", "").strip()
-    key = (ENV_OPENAI_KEY or key_from_db or "").strip()
-    model = (ENV_OPENAI_MODEL or model_from_db or "gpt-4o-mini").strip()
-    return (key, model)
+    key = get_setting("openai_key", ENV_OPENAI_KEY)
+    model = get_setting("openai_model", ENV_OPENAI_MODEL)
+    return (key.strip(), model.strip())
 
 def _title_from_text_fallback(fr_text: str) -> str:
     t = (fr_text or "").strip()
@@ -240,36 +224,14 @@ def _title_from_text_fallback(fr_text: str) -> str:
     base = base[:80]
     return base[:1].upper() + base[1:]
 
-def format_as_three_paragraphs(text: str) -> str:
-    """
-    Mise en page 'Arménie Info' :
-    - paragraphe 1 : chapeau (1–2 phrases)
-    - paragraphe 2 : détails (3–4 phrases)
-    - paragraphe 3 : contexte (1–2 phrases)
-    On re-découpe légèrement si l'IA renvoie un bloc unique.
-    """
-    text = (text or "").strip()
-    text = re.sub(r'\n{3,}', '\n\n', text).strip()
-    # si déjà des doubles sauts, on respecte
-    parts = [p.strip() for p in text.split("\n\n") if p.strip()]
-    if len(parts) >= 3:
-        return "\n\n".join(parts[:3])
-    # sinon on découpe par phrases
-    sentences = re.split(r'(?<=[\.\!\?])\s+', text)
-    p1 = " ".join(sentences[:2]).strip()
-    p2 = " ".join(sentences[2:6]).strip()
-    p3 = " ".join(sentences[6:8]).strip()
-    chunks = [p for p in [p1, p2, p3] if p]
-    return "\n\n".join(chunks) if chunks else text
+def ensure_signature(body: str) -> str:
+    b = (body or "").rstrip()
+    if not b.endswith("- Arménie Info"):
+        b += "\n\n- Arménie Info"
+    return b
 
 def rewrite_article_fr(title_src: str, raw_text: str):
-    """
-    Retourne (title_fr, body_fr, sure_fr).
-    - Forçage FR
-    - Style 'Arménie Info' (3 paragraphes)
-    - Signature unique
-    - Plafond strict BODY_MAX_WORDS
-    """
+    """Retourne (title_fr, body_fr, sure_fr). Pas de '(à traduire)'. Signature unique."""
     if not raw_text:
         return (title_src or "Actualité", "", False)
 
@@ -278,18 +240,8 @@ def rewrite_article_fr(title_src: str, raw_text: str):
 
     def call_openai():
         prompt = (
-            "Tu es un journaliste francophone d'Arménie Info. "
-            "Traduis et RÉÉCRIS en FRANÇAIS le TITRE et le CORPS de l'article ci-dessous. "
-            "STYLE DEMANDÉ : neutre, factuel, concis. Organisation en 3 paragraphes :\n"
-            "1) CHAPEAU (1–2 phrases claires)\n"
-            "2) DÉTAILS (3–4 phrases, données, citations)\n"
-            "3) CONTEXTE (1–2 phrases, rappel bref)\n\n"
-            "CONTRAINTES :\n"
-            "- Pas de balises HTML ni de listes\n"
-            "- 150 à 220 mots (environ) pour le corps AVANT signature\n"
-            "- Le corps doit SE TERMINER par la signature exacte : - Arménie Info\n"
-            "- Le titre doit être court, clair, informatif (max ~100 caractères)\n\n"
-            "RENVOIE STRICTEMENT du JSON avec les clés 'title' et 'body'.\n\n"
+            f"{JOURNO_STYLE}\n\n"
+            "RENVOIE UNIQUEMENT du JSON avec les clés 'title' et 'body'.\n"
             f"Titre (source): {title_src}\n"
             f"Texte (source): {clean_input}"
         )
@@ -297,14 +249,13 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             "model": model or "gpt-4o-mini",
             "temperature": 0.2,
             "messages": [
-                {"role": "system", "content": "Tu écris en français journalistique clair. Réponds UNIQUEMENT en JSON demandé."},
+                {"role": "system", "content": "Tu écris en français net et concis. Réponds uniquement en JSON."},
                 {"role": "user", "content": prompt}
             ]
         }
         r = requests.post("https://api.openai.com/v1/chat/completions",
                           headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                           json=payload, timeout=60)
-        r.raise_for_status()
         j = r.json()
         out = (j.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
         try:
@@ -315,14 +266,9 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             parts = out.split("\n", 1)
             title_fr = strip_tags(parts[0]).strip()
             body_fr  = strip_tags(parts[1] if len(parts) > 1 else "").strip()
-
-        # Mise en forme et limites
         if not body_fr:
-            body_fr = " ".join(clean_input.split()).strip()
-        body_fr = format_as_three_paragraphs(body_fr)
-        body_fr = trim_to_words(body_fr, BODY_MAX_WORDS)
+            body_fr = " ".join(clean_input.split()[:220]).strip()
         body_fr = ensure_signature(body_fr)
-
         if not title_fr:
             title_fr = _title_from_text_fallback(body_fr)
         return title_fr, body_fr
@@ -332,19 +278,15 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             t1, b1 = call_openai()
             if looks_french(b1) and looks_french(t1):
                 return (t1, b1, True)
-            # 2e tentative si non détecté FR
             t2, b2 = call_openai()
             if looks_french(b2) and looks_french(t2):
                 return (t2, b2, True)
-            # Sinon on garde tout de même le texte, déjà formaté/signé
-            return (_title_from_text_fallback(b2), b2, False)
+            return (_title_from_text_fallback(b2), ensure_signature(b2), False)
         except Exception as e:
             print(f"[AI] rewrite_article_fr failed: {e}")
 
-    # Fallback local (pas de vraie traduction)
-    fr_body = " ".join(strip_tags(raw_text).split()).strip()
-    fr_body = format_as_three_paragraphs(fr_body)
-    fr_body = trim_to_words(fr_body, BODY_MAX_WORDS)
+    # Fallback local
+    fr_body = " ".join(strip_tags(raw_text).split()[:220]).strip()
     fr_title = _title_from_text_fallback(fr_body)
     fr_body = ensure_signature(fr_body)
     return (fr_title, fr_body, False)
@@ -381,25 +323,21 @@ def soup_select_attr(soup, selector):
 
 def find_main_image_in_html(html, base_url=None):
     soup = BeautifulSoup(html, "html.parser")
-    # og/twitter
     for sel in ["meta[property='og:image']","meta[name='twitter:image']"]:
         m = soup.select_one(sel)
         if m and m.get("content"):
             return urljoin(base_url or "", m["content"])
-    # première image dans article
     a = soup.find("article")
     if a:
         imgtag = a.find("img")
         if imgtag and imgtag.get("src"):
-            return urljoin(base_url or "", imgtag.get("src"))
-    # fallback: première image
+            return urljoin(base_url or "", imgtag["src"])
     imgtag = soup.find("img")
     if imgtag and imgtag.get("src"):
-        return urljoin(base_url or "", imgtag.get("src"))
+        return urljoin(base_url or "", imgtag["src"])
     return None
 
 def get_image_from_entry(entry, page_html=None, page_url=None):
-    # 1) champs RSS media/enclosure
     try:
         media = entry.get("media_content") or entry.get("media_thumbnail")
         if isinstance(media, list) and media:
@@ -412,13 +350,10 @@ def get_image_from_entry(entry, page_html=None, page_url=None):
         if isinstance(enc, list):
             for en in enc:
                 href = en.get("href") if isinstance(en, dict) else None
-                if href:
-                    ext = href.lower().split("?")[0]
-                    if any(ext.endswith(x) for x in (".jpg",".jpeg",".png",".webp",".gif")):
-                        return urljoin(page_url or "", href)
+                if href and any(href.lower().split("?")[0].endswith(ext) for ext in (".jpg",".jpeg",".png",".webp",".gif")):
+                    return urljoin(page_url or "", href)
     except Exception:
         pass
-    # 2) img dans le contenu RSS (summary/content)
     for k in ("content","summary","description"):
         v = entry.get(k)
         if not v: continue
@@ -433,8 +368,7 @@ def get_image_from_entry(entry, page_html=None, page_url=None):
             s = BeautifulSoup(html, "html.parser")
             imgtag = s.find("img")
             if imgtag and imgtag.get("src"):
-                return urljoin(page_url or "", imgtag.get("src"))
-    # 3) page HTML
+                return urljoin(page_url or "", imgtag["src"])
     if page_html:
         return find_main_image_in_html(page_html, base_url=page_url)
     return None
@@ -446,10 +380,8 @@ def download_image(url):
         r.raise_for_status()
         data = r.content
         sha1 = hashlib.sha1(data).hexdigest()
-        # valide l'image
         try:
-            im = Image.open(io.BytesIO(data))
-            im.verify()
+            im = Image.open(io.BytesIO(data)); im.verify()
         except (UnidentifiedImageError, Exception) as e:
             print(f"[IMG] verify fail {url}: {e}")
             return None, None
@@ -503,7 +435,6 @@ def already_have_link(link: str) -> bool:
 def insert_post(title_fr, body_text, link, source, img_url):
     local_path, sha1 = download_image(img_url) if img_url else (None, None)
     if sha1:
-        # pas de doublon image
         con = db()
         try:
             if con.execute("SELECT 1 FROM posts WHERE image_sha1=?", (sha1,)).fetchone():
@@ -525,9 +456,8 @@ def insert_post(title_fr, body_text, link, source, img_url):
     finally:
         con.close()
 
-def scrape_rss_once(feeds, default_image_url=None):
+def scrape_rss_once(feeds, default_image_url=None, per_feed_limit=DEFAULT_RSS_LIMIT_PER_FEED):
     created, skipped = 0, 0
-    rss_limit = int(get_setting("rss_limit", str(DEFAULT_RSS_LIMIT)) or DEFAULT_RSS_LIMIT)
     for feed in feeds:
         try:
             fp = feedparser.parse(feed)
@@ -535,7 +465,8 @@ def scrape_rss_once(feeds, default_image_url=None):
             print(f"[FEED] parse error {feed}: {e}")
             continue
         feed_title = fp.feed.get("title","") if getattr(fp, "feed", None) else ""
-        for e in getattr(fp, "entries", [])[:rss_limit]:
+        entries = getattr(fp, "entries", [])[: int(per_feed_limit)]
+        for e in entries:
             try:
                 link = e.get("link") or ""
                 if not link or already_have_link(link):
@@ -579,19 +510,19 @@ def normalize_url(base, href):
     if href.startswith("#"): return None
     return urljoin(base, href)
 
-def scrape_index_once(scrapers_json, default_image_url=None):
+def scrape_index_once(scrapers_json, default_image_url=None, per_site_limit=DEFAULT_SCRAPE_LIMIT_PER_SITE):
     created, skipped = 0, 0
-    default_limit = int(get_setting("scraper_limit", str(DEFAULT_SCRAPER_LIMIT)) or DEFAULT_SCRAPER_LIMIT)
     for cfg in scrapers_json:
         try:
             name = cfg.get("name","")
             index_url = cfg["index_url"]
             link_sel  = cfg["link_selector"]
-            max_items = int(cfg.get("max_items", default_limit) or default_limit)
+            max_items_cfg = int(cfg.get("max_items", per_site_limit))
+            max_items = min(int(per_site_limit), max_items_cfg)
+
             html = http_get(index_url)
             soup = BeautifulSoup(html, "html.parser")
             links = []
-            # On prélève un peu large puis on dédoublonne
             for a in soup.select(link_sel)[: max_items * 3]:
                 href = a.get("href")
                 full = normalize_url(index_url, href)
@@ -676,6 +607,131 @@ def publish_due_loop():
             print("[SCHED] loop error:", e)
         time.sleep(30)
 
+# ================== IMPORT ASYNC (ÉTAT + ROUTES) ==================
+IMPORT_LOCK = threading.Lock()
+IMPORT_STATE = {
+    "running": False,
+    "done": False,
+    "ok": 0,
+    "skip": 0,
+    "errors": 0,
+    "step": "",
+    "log": [],
+    "started_at": None,
+    "cancel": False,
+}
+
+def reset_import_state():
+    with IMPORT_LOCK:
+        IMPORT_STATE.update({
+            "running": True, "done": False, "ok": 0, "skip": 0, "errors": 0,
+            "step": "initialisation", "log": [], "started_at": datetime.now(timezone.utc).isoformat(), "cancel": False
+        })
+
+def finish_import_state():
+    with IMPORT_LOCK:
+        IMPORT_STATE["running"] = False
+        IMPORT_STATE["done"] = True
+
+def cancel_requested():
+    with IMPORT_LOCK:
+        return IMPORT_STATE.get("cancel", False)
+
+def log_progress(msg):
+    ts = datetime.now().strftime("%H:%M:%S")
+    with IMPORT_LOCK:
+        IMPORT_STATE["log"].append(f"[{ts}] {msg}")
+        IMPORT_STATE["step"] = msg
+        if len(IMPORT_STATE["log"]) > 500:
+            IMPORT_STATE["log"] = IMPORT_STATE["log"][-500:]
+
+def run_import_job():
+    try:
+        default_image = get_setting("default_image_url","").strip() or None
+        feeds_txt = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
+        feed_list = [u.strip() for u in feeds_txt.splitlines() if u.strip()]
+        rss_limit = int(get_setting("rss_limit_per_feed", str(DEFAULT_RSS_LIMIT_PER_FEED)))
+        scrape_limit = int(get_setting("scrape_limit_per_site", str(DEFAULT_SCRAPE_LIMIT_PER_SITE)))
+
+        try:
+            scrapers_cfg = _json.loads(get_setting("scrapers_json", _json.dumps(DEFAULT_SCRAPERS)))
+            if not isinstance(scrapers_cfg, list):
+                raise ValueError("Le JSON de scrapers doit être une liste []")
+        except Exception as e:
+            log_progress(f"Erreur de configuration des scrapers: {e}")
+            return
+
+        log_progress("Import RSS…")
+        c1, s1 = scrape_rss_once(feed_list, default_image_url=default_image, per_feed_limit=rss_limit)
+
+        if cancel_requested():
+            log_progress("Import annulé après RSS.");  finish_import_state();  return
+
+        log_progress("Import scraping…")
+        c2, s2 = scrape_index_once(scrapers_cfg, default_image_url=default_image, per_site_limit=scrape_limit)
+
+        with IMPORT_LOCK:
+            IMPORT_STATE["ok"] = c1 + c2
+            IMPORT_STATE["skip"] = s1 + s2
+        log_progress(f"Terminé: {c1+c2} nouveaux, {s1+s2} ignorés.")
+    except Exception as e:
+        with IMPORT_LOCK:
+            IMPORT_STATE["errors"] += 1
+        log_progress(f"[IMPORT] Fatal: {e}")
+        traceback.print_exc()
+    finally:
+        finish_import_state()
+
+def _start_import_if_possible():
+    with IMPORT_LOCK:
+        if IMPORT_STATE["running"]:
+            return False, "Un import est déjà en cours."
+        reset_import_state()
+    threading.Thread(target=run_import_job, daemon=True).start()
+    return True, "Import lancé en arrière-plan. Le statut s’actualise ci-dessous."
+
+@app.route("/import-now", methods=["GET", "POST"])
+def import_now():
+    if not session.get("ok"):
+        flash("Connecte-toi pour lancer un import.")
+        return redirect(url_for("admin"))
+    try:
+        ok, msg = _start_import_if_possible()
+        flash(msg)
+    except Exception as e:
+        flash(f"Erreur au démarrage de l’import : {e}")
+    return redirect(url_for("admin"))
+
+@app.route("/import-start", methods=["GET", "POST"])
+def import_start():
+    return import_now()
+
+@app.get("/import-status")
+def import_status():
+    with IMPORT_LOCK:
+        return jsonify({
+            "running": IMPORT_STATE["running"],
+            "done": IMPORT_STATE["done"],
+            "ok": IMPORT_STATE["ok"],
+            "skip": IMPORT_STATE["skip"],
+            "errors": IMPORT_STATE["errors"],
+            "step": IMPORT_STATE["step"],
+            "log": IMPORT_STATE["log"][-120:],
+            "started_at": IMPORT_STATE["started_at"],
+        })
+
+@app.route("/import-cancel", methods=["GET","POST"])
+def import_cancel():
+    if not session.get("ok"):
+        return redirect(url_for("admin"))
+    with IMPORT_LOCK:
+        if IMPORT_STATE["running"]:
+            IMPORT_STATE["cancel"] = True
+            flash("Annulation demandée. Le job va s'arrêter proprement.")
+        else:
+            flash("Aucun import en cours.")
+    return redirect(url_for("admin"))
+
 # ================== UI ==================
 LAYOUT = """
 <!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -734,27 +790,13 @@ def rss_xml():
     finally:
         con.close()
     items = []
-    base_url = request.url_root.rstrip("/")
     for r in rows:
         title = (r["title"] or "").replace("&","&amp;")
         desc  = (r["body"] or "").replace("&","&amp;")
-        enclosure = f"<enclosure url='{base_url + r['image_url']}' type='image/jpeg'/>" if r["image_url"] else ""
+        enclosure = f"<enclosure url='{request.url_root.rstrip('/') + r['image_url']}' type='image/jpeg'/>" if r["image_url"] else ""
         pub   = datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S %z')
-        items.append(
-            f"<item><title>{title}</title>"
-            f"<link>{base_url}</link>"
-            f"<guid isPermaLink='false'>{r['id']}</guid>"
-            f"<description><![CDATA[{desc}]]></description>"
-            f"{enclosure}<pubDate>{pub}</pubDate></item>"
-        )
-    rss = (
-        "<?xml version='1.0' encoding='UTF-8'?>"
-        "<rss version='2.0'><channel>"
-        f"<title>{APP_NAME} — Flux</title>"
-        f"<link>{base_url}</link>"
-        f"<description>Articles publiés</description>"
-        f"{''.join(items)}</channel></rss>"
-    )
+        items.append(f"<item><title>{title}</title><link>{request.url_root}</link><guid isPermaLink='false'>{r['id']}</guid><description><![CDATA[{desc}]]></description>{enclosure}<pubDate>{pub}</pubDate></item>")
+    rss = f"<?xml version='1.0' encoding='UTF-8'?><rss version='2.0'><channel><title>{APP_NAME} — Flux</title><link>{request.url_root}</link><description>Articles publiés</description>{''.join(items)}</channel></rss>"
     return Response(rss, mimetype="application/rss+xml")
 
 @app.route("/admin", methods=["GET","POST"])
@@ -771,14 +813,12 @@ def admin():
           <button>Entrer</button></form>""", "Connexion")
 
     feeds = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
-    openai_key   = get_setting("openai_key", ENV_OPENAI_KEY)  # affichage seulement (ENV prioritaire à l'exécution)
+    openai_key   = get_setting("openai_key", ENV_OPENAI_KEY)
     openai_model = get_setting("openai_model", ENV_OPENAI_MODEL)
     default_image = get_setting("default_image_url", "").strip()
     scrapers_json_txt = get_setting("scrapers_json", _json.dumps(DEFAULT_SCRAPERS, ensure_ascii=False, indent=2))
-
-    # Nouvelles limites configurables
-    rss_limit = int(get_setting("rss_limit", str(DEFAULT_RSS_LIMIT)) or DEFAULT_RSS_LIMIT)
-    scraper_limit = int(get_setting("scraper_limit", str(DEFAULT_SCRAPER_LIMIT)) or DEFAULT_SCRAPER_LIMIT)
+    rss_limit = get_setting("rss_limit_per_feed", str(DEFAULT_RSS_LIMIT_PER_FEED))
+    scrape_limit = get_setting("scrape_limit_per_site", str(DEFAULT_SCRAPE_LIMIT_PER_SITE))
 
     con = db()
     try:
@@ -800,7 +840,7 @@ def admin():
           {img}
           <form method="post" action="{url_for('save', post_id=r['id'])}">
             <label>Titre<input name="title" value="{(r['title'] or '').replace('"','&quot;')}"></label>
-            <label>Contenu<textarea name="body" rows="8">{r['body'] or ''}</textarea></label>
+            <label>Contenu<textarea name="body" rows="6">{r['body'] or ''}</textarea></label>
             <div class="grid">
               <button name="action" value="save">💾 Enregistrer</button>
               {state_btns}
@@ -828,16 +868,16 @@ def admin():
           </label>
         </div>
         <div class="grid">
-          <label>Limite par flux RSS
-            <input type="number" name="rss_limit" min="1" max="100" value="{rss_limit}">
+          <label>Image par défaut (URL)
+            <input name="default_image_url" placeholder="https://..." value="{default_image}">
           </label>
-          <label>Limite par site (scraping)
-            <input type="number" name="scraper_limit" min="1" max="50" value="{scraper_limit}">
+          <label>Articles par flux RSS
+            <input name="rss_limit_per_feed" type="number" min="1" max="50" value="{rss_limit}">
+          </label>
+          <label>Liens par site (scraping)
+            <input name="scrape_limit_per_site" type="number" min="1" max="30" value="{scrape_limit}">
           </label>
         </div>
-        <label>Image par défaut (URL)
-          <input name="default_image_url" placeholder="https://..." value="{default_image}">
-        </label>
         <label>Sources RSS (une URL par ligne)
           <textarea name="feeds" rows="5">{feeds}</textarea>
         </label>
@@ -848,7 +888,28 @@ def admin():
 
       <form method="post" action="{url_for('import_now')}" style="margin-top:1rem">
         <button type="submit">🔁 Importer maintenant (RSS + Scraping)</button>
+        <a class="secondary" href="{url_for('import_cancel')}">Annuler</a>
       </form>
+
+      <article style="margin-top:1rem">
+        <h5>Statut import</h5>
+        <pre id="import-log" style="max-height:240px; overflow:auto; background:#111; color:#9f9; padding:8px; border-radius:6px"></pre>
+        <small id="import-meta"></small>
+      </article>
+      <script>
+      async function poll() {{
+        try {{
+          const r = await fetch("{url_for('import_status')}");
+          const j = await r.json();
+          document.getElementById('import-log').textContent = (j.log||[]).join("\\n");
+          document.getElementById('import-meta').textContent =
+            (j.running ? "Import en cours…" : (j.done ? "Import terminé." : "Prêt.")) +
+            "  |  nouveaux: " + j.ok + "  ignorés: " + j.skip + "  erreurs: " + j.errors;
+        }} catch(e) {{}}
+        setTimeout(poll, 2000);
+      }}
+      poll();
+      </script>
     </article>
 
     <h4>Brouillons</h4>{''.join(card(r) for r in drafts) or "<p>Aucun brouillon.</p>"}
@@ -865,21 +926,8 @@ def save_settings():
     set_setting("openai_model", request.form.get("openai_model","").strip())
     set_setting("feeds", request.form.get("feeds",""))
     set_setting("default_image_url", request.form.get("default_image_url","").strip())
-
-    # Limites d'import
-    rss_limit_in = request.form.get("rss_limit","").strip()
-    scraper_limit_in = request.form.get("scraper_limit","").strip()
-    try:
-        if rss_limit_in:
-            val = max(1, min(100, int(rss_limit_in)))
-            set_setting("rss_limit", str(val))
-        if scraper_limit_in:
-            val = max(1, min(50, int(scraper_limit_in)))
-            set_setting("scraper_limit", str(val))
-    except ValueError:
-        flash("Limites invalides : entrez des nombres.")
-
-    # Scrapers JSON valide ?
+    set_setting("rss_limit_per_feed", request.form.get("rss_limit_per_feed","").strip() or str(DEFAULT_RSS_LIMIT_PER_FEED))
+    set_setting("scrape_limit_per_site", request.form.get("scrape_limit_per_site","").strip() or str(DEFAULT_SCRAPE_LIMIT_PER_SITE))
     scrapers_txt = request.form.get("scrapers_json","").strip()
     try:
         _json.loads(scrapers_txt or "[]")
@@ -887,41 +935,6 @@ def save_settings():
         flash("Paramètres enregistrés.")
     except Exception as e:
         flash(f"Config sites JSON invalide : {e}")
-    return redirect(url_for("admin"))
-
-@app.post("/import-now")
-def import_now():
-    if not session.get("ok"): return redirect(url_for("admin"))
-    default_image = get_setting("default_image_url","").strip() or None
-
-    # RSS
-    feeds_txt = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
-    feed_list = [u.strip() for u in feeds_txt.splitlines() if u.strip()]
-
-    # Scrapers
-    try:
-        scrapers_cfg = _json.loads(get_setting("scrapers_json", _json.dumps(DEFAULT_SCRAPERS)))
-        if not isinstance(scrapers_cfg, list):
-            raise ValueError("Le JSON de scrapers doit être une liste []")
-    except Exception as e:
-        flash(f"Erreur d’import (sites) : Config sites JSON invalide: {e}")
-        return redirect(url_for("admin"))
-
-    total_created = total_skipped = 0
-    try:
-        c1, s1 = scrape_rss_once(feed_list, default_image_url=default_image)
-        c2, s2 = scrape_index_once(scrapers_cfg, default_image_url=default_image)
-        total_created, total_skipped = c1 + c2, s1 + s2
-        flash(f"Import terminé : {total_created} nouveaux, {total_skipped} ignorés.")
-    except Exception as e:
-        print("[IMPORT] fatal:", e)
-        traceback.print_exc()
-        flash(f"Erreur d’import : {e}")
-    return redirect(url_for("admin"))
-
-@app.get("/import-now")
-def import_now_get():
-    flash("Utilise le bouton « Importer maintenant » dans l’admin.")
     return redirect(url_for("admin"))
 
 @app.post("/save/<int:post_id>")
@@ -933,7 +946,6 @@ def save(post_id):
     publish_at = request.form.get("publish_at","").strip()
 
     if body:
-        body = trim_to_words(body, BODY_MAX_WORDS)
         body = ensure_signature(body)
 
     con = db()
