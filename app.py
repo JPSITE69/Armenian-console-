@@ -1,7 +1,7 @@
 from flask import Flask, request, redirect, url_for, Response, render_template_string, session, flash
 import sqlite3, os, hashlib, io, traceback, re, threading, time, json as _json
 from datetime import datetime, timezone
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 import feedparser
@@ -55,7 +55,6 @@ def init_db():
         key TEXT PRIMARY KEY,
         value TEXT
     )""")
-    # colonnes déjà gérées plus haut ; on garde la compat
     if not column_exists(con, "posts", "publish_at"):
         con.execute("ALTER TABLE posts ADD COLUMN publish_at TEXT")
     con.commit(); con.close()
@@ -79,7 +78,9 @@ def set_setting(key, value):
 
 # ================== UTILS TEXTE ==================
 TAG_RE = re.compile(r"<[^>]+>")
-FR_TOKENS = set(" le la les un une des du de au aux et en sur pour par avec dans que qui ne pas est été sont était selon afin aussi plus leur lui ses ces cette ce cela donc ainsi tandis alors contre entre vers depuis sans sous après avant comme lorsque tandis que où dont même plus très très".split())
+FR_TOKENS = set((" le la les un une des du de au aux et en sur pour par avec dans que qui ne pas est été "
+                 "sont était selon afin aussi plus leur lui ses ces cette ce cela donc ainsi tandis alors "
+                 "contre entre vers depuis sans sous après avant comme lorsque où dont même très").split())
 BAD_IMG_PAT = re.compile(r"(sprite|logo|icon|placeholder|promo|ads|banner|pixel|gif)", re.I)
 
 def strip_tags(s: str) -> str:
@@ -120,18 +121,16 @@ def _title_from_text_fallback(fr_text: str) -> str:
 def ensure_signature(body: str) -> str:
     """Ajoute une seule fois la signature - Arménie Info, jamais en double."""
     b = (body or "").strip()
-    b = re.sub(r"\s*\-+\s*Arménie\s+Info\.?\s*$", "", b, flags=re.I)
+    b = re.sub(r"\s*\-+\s*Arménie\s+Info\.?\s*$", "", b, flags=re.I)  # supprime une éventuelle signature existante
     if not b.endswith("- Arménie Info"):
         b += "\n\n- Arménie Info"
     return b
 
 def clean_article_text(txt: str) -> str:
-    """Supprime balises, espaces parasites et ne garde que du texte brut."""
+    """Supprime balises, espaces parasites; supprime '(à traduire)'; normalise sauts de ligne."""
     txt = strip_tags(txt or "")
-    # Enlever tout "(à traduire)" résiduel
-    txt = re.sub(r"\(\s*à\s*traduire\s*\)\s*$", "", txt, flags=re.I).strip()
-    # Normalise retours à la ligne multiples
-    txt = re.sub(r"\n{3,}", "\n\n", txt)
+    txt = re.sub(r"\(\s*à\s*traduire\s*\)\s*$", "", txt, flags=re.I).strip()  # enlève toute trace
+    txt = re.sub(r"\n{3,}", "\n\n", txt)  # compresse sauts de ligne multiples
     return txt.strip()
 
 # ================== OPENAI - RÉÉCRITURE ==================
@@ -179,7 +178,6 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             title_fr = clean_article_text(data.get("title",""))
             body_fr  = clean_article_text(data.get("body",""))
         except Exception:
-            # Tolérance si le modèle ne renvoie pas du JSON propre
             parts = out.split("\n", 1)
             title_fr = clean_article_text(parts[0] if parts else "")
             body_fr  = clean_article_text(parts[1] if len(parts) > 1 else "")
@@ -407,7 +405,7 @@ def html_from_entry(entry):
         if isinstance(entry.content, dict): return entry.content.get("value","")
     return entry.get("summary","") or entry.get("description","")
 
-# ================== SCRAPE ==================
+# ================== SCRAPE RSS ==================
 def scrape_once(feeds):
     created, skipped = 0, 0
     default_image = (get_setting("default_image_url", "").strip() or None)
@@ -455,16 +453,6 @@ def scrape_once(feeds):
                     img_url = get_image_from_entry(e, page_html=page_html, page_url=feed_link)
                 local_path, sha1 = download_image(img_url) if img_url else (None, None)
 
-                # anti-doublon image (facultatif mais utile)
-                if sha1:
-                    con = db()
-                    try:
-                        if con.execute("SELECT 1 FROM posts WHERE image_sha1=?", (sha1,)).fetchone():
-                            # Image déjà vue → on ne jette pas l'article, mais on évite dupliquer l'image
-                            pass
-                    finally:
-                        con.close()
-
                 # TITRE + TEXTE EN FR (robuste)
                 title_fr, body_text, sure_fr = rewrite_article_fr(title_src, article_text)
                 if not body_text:
@@ -474,13 +462,12 @@ def scrape_once(feeds):
                 final_image = local_path
                 final_sha1  = sha1
                 if not final_image and default_image:
-                    # on essaie de télécharger/cache l'image par défaut une fois
                     local_path2, sha1b = download_image(default_image)
                     final_image = local_path2
                     final_sha1  = sha1b
 
                 now = datetime.now(timezone.utc).isoformat()
-                status = "draft"  # reste en brouillon pour validation
+                status = "draft"  # reste en brouillon
 
                 con = db()
                 try:
@@ -496,6 +483,204 @@ def scrape_once(feeds):
                 skipped += 1
                 print(f"[ENTRY] skipped due to error: {e}")
                 traceback.print_exc()
+    return created, skipped
+
+# ================== SCRAPE SITES (SANS RSS) ==================
+def _unique_keep_order(seq):
+    seen = set(); out = []
+    for x in seq:
+        if x in seen: continue
+        seen.add(x); out.append(x)
+    return out
+
+def _collect_article_links(index_html, base_url, link_selector=None, max_links=6):
+    soup = BeautifulSoup(index_html or "", "html.parser")
+    links = []
+
+    if link_selector:
+        for a in soup.select(link_selector):
+            href = a.get("href")
+            if not href: continue
+            href = urljoin(base_url, href)
+            links.append(href)
+    else:
+        # Heuristique générique
+        for a in soup.select("article a, h2 a, h3 a"):
+            href = a.get("href")
+            if not href: continue
+            href = urljoin(base_url, href)
+            links.append(href)
+
+    # Filtre basique: pas d'ancres/mailto/js
+    cleaned = []
+    for u in links:
+        if u.startswith("mailto:") or u.startswith("javascript:"): 
+            continue
+        cleaned.append(u)
+
+    cleaned = _unique_keep_order(cleaned)
+    return cleaned[:max_links]
+
+def extract_article_page(html, page_url, sel=None):
+    """
+    Extrait (title, text, img_url) depuis une page d'article.
+    - sel: dict optionnel avec title_selector, content_selector, image_selector
+    Fallback: utilise les extracteurs génériques existants.
+    """
+    soup = BeautifulSoup(html or "", "html.parser")
+    title, text, img = "", "", None
+
+    # Titre
+    if sel and sel.get("title_selector"):
+        n = soup.select_one(sel["title_selector"])
+        if n: title = n.get_text(" ", strip=True)
+    if not title:
+        h = soup.find(["h1","h2"]) or soup.select_one("article h1, article h2")
+        if h: title = h.get_text(" ", strip=True)
+
+    # Contenu
+    if sel and sel.get("content_selector"):
+        node = soup.select_one(sel["content_selector"])
+        if node:
+            text = " ".join(p.get_text(" ", strip=True) for p in (node.find_all(["p","li"]) or [node]))
+            text = re.sub(r"\s+", " ", text).strip()
+
+    if not text:
+        # fallback : fonction générique
+        text = extract_article_text(html)
+
+    # Image
+    if sel and sel.get("image_selector"):
+        imn = soup.select_one(sel["image_selector"])
+        if imn:
+            if imn.name == "img":
+                cand = imn.get("src") or imn.get("data-src") or imn.get("data-original") or parse_srcset(imn.get("srcset"))
+                if cand: img = urljoin(page_url or "", cand)
+            else:
+                cand = imn.get("content")
+                if cand: img = urljoin(page_url or "", cand)
+
+    if not img:
+        img = find_main_image_in_html(html, base_url=page_url)
+    if not img:
+        # dernière chance: première img du HTML
+        s = BeautifulSoup(html or "", "html.parser")
+        for im in s.find_all("img"):
+            cand = im.get("src") or im.get("data-src") or im.get("data-original") or parse_srcset(im.get("srcset"))
+            if not cand: 
+                continue
+            if BAD_IMG_PAT.search(cand):
+                continue
+            img = urljoin(page_url or "", cand)
+            break
+
+    return (title, text, img)
+
+def scrape_sites_once(sites_cfg_text, per_site=6):
+    """
+    sites_cfg_text: JSON en admin, ex:
+    [
+      {
+        "name": "CivilNet",
+        "index_url": "https://www.civilnet.am/news/",
+        "link_selector": "article h3 a",
+        "title_selector": "h1",
+        "content_selector": "article .content, article .entry-content",
+        "image_selector": "meta[property='og:image']"
+      }
+    ]
+    """
+    try:
+        sites = _json.loads(sites_cfg_text or "[]")
+        if not isinstance(sites, list):
+            raise ValueError("JSON sites invalide: attend une liste []")
+    except Exception as e:
+        raise ValueError(f"Config sites JSON invalide: {e}")
+
+    created, skipped = 0, 0
+    default_image = (get_setting("default_image_url", "").strip() or None)
+
+    for site in sites:
+        try:
+            idx = site.get("index_url","").strip()
+            if not idx: 
+                continue
+            link_sel = site.get("link_selector","")
+            sel = {
+                "title_selector":   site.get("title_selector",""),
+                "content_selector": site.get("content_selector",""),
+                "image_selector":   site.get("image_selector",""),
+            }
+
+            try:
+                index_html = http_get(idx)
+            except Exception as e:
+                print(f"[SITE] index fail {idx}: {e}")
+                continue
+
+            links = _collect_article_links(index_html, idx, link_selector=link_sel or None, max_links=per_site or 6)
+            if not links:
+                print(f"[SITE] aucun lien détecté pour {idx}")
+                continue
+
+            for link in links:
+                try:
+                    # doublon ?
+                    con = db()
+                    try:
+                        if con.execute("SELECT 1 FROM posts WHERE orig_link=?", (link,)).fetchone():
+                            skipped += 1; con.close(); continue
+                    finally:
+                        con.close()
+
+                    # fetch article
+                    try:
+                        page_html = http_get(link)
+                    except Exception as e:
+                        print(f"[SITE] article fail {link}: {e}")
+                        skipped += 1; continue
+
+                    title_raw, text_raw, img_url = extract_article_page(page_html, link, sel=sel)
+
+                    if not text_raw or len(strip_tags(text_raw)) < 120:
+                        text_raw = extract_article_text(page_html)
+                    if not text_raw or len(strip_tags(text_raw)) < 120:
+                        skipped += 1
+                        continue
+
+                    # Image
+                    local_path, sha1 = download_image(img_url) if img_url else (None, None)
+                    if not local_path and default_image:
+                        local_path, sha1 = download_image(default_image)
+
+                    # Rewrite FR
+                    title_fr, body_text, sure_fr = rewrite_article_fr(title_raw, text_raw)
+                    if not body_text:
+                        skipped += 1; continue
+
+                    now = datetime.now(timezone.utc).isoformat()
+                    status = "draft"  # reste en brouillon
+
+                    con = db()
+                    try:
+                        con.execute("""INSERT INTO posts
+                          (title, body, status, created_at, updated_at, publish_at, image_url, image_sha1, orig_link, source)
+                          VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                          (title_fr, body_text, status, now, now, None, local_path, sha1, link, site.get("name","")))
+                        con.commit()
+                        created += 1
+                    finally:
+                        con.close()
+
+                except Exception as ee:
+                    print(f"[SITE] skip {link}: {ee}")
+                    traceback.print_exc()
+                    skipped += 1
+
+        except Exception as e:
+            print(f"[SITE] config skip: {e}")
+            traceback.print_exc()
+
     return created, skipped
 
 # ================== SCHEDULER (publication auto) ==================
@@ -570,17 +755,14 @@ def home():
         img = f"<img src='{r['image_url']}' alt='' style='max-width:100%;height:auto'>" if r["image_url"] else ""
         created = (r['created_at'] or '')[:16].replace('T',' ')
         body_html = (r['body'] or '').replace("\n", "<br>")
-        # Ajout de la source et lien original si dispo
-        source = r.get("source", "") if isinstance(r, dict) else r["source"]
-        link   = r.get("orig_link", "") if isinstance(r, dict) else r["orig_link"]
+        source = (r["source"] or "")
+        link   = (r["orig_link"] or "")
         meta = ""
         if source or link:
             src = f"<small>Source: {source}</small>" if source else ""
             lnk = f"<small> | <a href='{link}' target='_blank' rel='noopener'>Lien original</a></small>" if link else ""
             meta = f"<p>{src}{lnk}</p>"
-        cards.append(
-            f"<article><header><h3>{r['title']}</h3><small>{created}</small></header>{img}{meta}<p>{body_html}</p></article>"
-        )
+        cards.append(f"<article><header><h3>{r['title']}</h3><small>{created}</small></header>{img}{meta}<p>{body_html}</p></article>")
     return page("<h2>Dernières publications</h2>" + "".join(cards), "Publications")
 
 @app.get("/rss.xml")
@@ -632,10 +814,19 @@ def admin():
           <button>Entrer</button></form>""", "Connexion")
 
     feeds = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
-    # On n’affiche PAS la clé ENV. L’ENV est prioritaire, la clé en base sert de secours.
     openai_key_in_db   = get_setting("openai_key", "")
     openai_model       = get_setting("openai_model", ENV_OPENAI_MODEL)
     default_image_url  = get_setting("default_image_url", "")
+    sites_json         = get_setting("sites_json", """[
+  {
+    "name": "CivilNet",
+    "index_url": "https://www.civilnet.am/news/",
+    "link_selector": "article h3 a",
+    "title_selector": "h1",
+    "content_selector": "article .content, article .entry-content",
+    "image_selector": "meta[property='og:image']"
+  }
+]""")
 
     con = db()
     try:
@@ -695,12 +886,21 @@ def admin():
         <label>Sources RSS (une URL par ligne)
           <textarea name="feeds" rows="6">{feeds}</textarea>
         </label>
+        <label>Scrapers de sites (JSON)
+          <textarea name="sites_json" rows="12">{sites_json}</textarea>
+        </label>
         <button>💾 Enregistrer les paramètres</button>
       </form>
+
       <form method="post" action="{url_for('import_now')}" style="margin-top:1rem">
-        <button type="submit">🔁 Importer maintenant (scraping + réécriture)</button>
+        <button type="submit">🔁 Importer maintenant (RSS)</button>
       </form>
-      <p><small>Note: si une clé OpenAI est définie dans l'ENV de Render, elle sera utilisée en priorité.</small></p>
+
+      <form method="post" action="{url_for('import_sites')}" style="margin-top:0.5rem">
+        <button type="submit">🕷️ Importer (scraping sites)</button>
+      </form>
+
+      <p><small>Note: si une clé OpenAI est définie dans l'ENV de Render (OPENAI_API_KEY), elle est utilisée en priorité.</small></p>
     </article>
 
     <h4>Brouillons</h4>{''.join(card(r) for r in drafts) or "<p>Aucun brouillon.</p>"}
@@ -717,6 +917,7 @@ def save_settings():
     set_setting("openai_model", request.form.get("openai_model","").strip())
     set_setting("default_image_url", request.form.get("default_image_url","").strip())
     set_setting("feeds", request.form.get("feeds",""))
+    set_setting("sites_json", request.form.get("sites_json",""))
     flash("Paramètres enregistrés.")
     return redirect(url_for("admin"))
 
@@ -735,6 +936,22 @@ def import_now():
         print("[IMPORT] fatal:", e)
         traceback.print_exc()
         flash(f"Erreur d’import : {e}")
+    return redirect(url_for("admin"))
+
+@app.post("/import-sites")
+def import_sites():
+    if not session.get("ok"): return redirect(url_for("admin"))
+    sites_cfg = get_setting("sites_json","").strip()
+    if not sites_cfg:
+        flash("Aucun scraper de site configuré (JSON).")
+        return redirect(url_for("admin"))
+    try:
+        created, skipped = scrape_sites_once(sites_cfg, per_site=6)  # change à 5–7 si tu veux
+        flash(f"Scraping sites terminé : {created} nouveaux, {skipped} ignorés.")
+    except Exception as e:
+        print("[IMPORT-SITES] fatal:", e)
+        traceback.print_exc()
+        flash(f"Erreur d’import (sites) : {e}")
     return redirect(url_for("admin"))
 
 @app.get("/import-now")
@@ -794,6 +1011,5 @@ init_db()
 threading.Thread(target=publish_due_loop, daemon=True).start()
 
 if __name__ == "__main__":
-    # Sur Render, PORT est défini. En local, on garde 5000.
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True)
