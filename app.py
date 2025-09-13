@@ -21,8 +21,8 @@ DEFAULT_FEEDS = [
     "https://news.am/eng/rss/",
     "https://factor.am/feed",
     "https://hetq.am/hy/rss",
-    # API JSON d'Azatutyun : on l'attrape via scraping (voir DEFAULT_SCRAPERS)
-    "https://www.azatutyun.am/api/zuvvyl-vomx-tpegqkv",
+    # NB: l'API JSON d'Azatutyun n'est pas un RSS classique, on la couvre via le scraper ci-dessous
+    # "https://www.azatutyun.am/api/zuvvyl-vomx-tpegqkv",
 ]
 
 # ---- Scrapers d'index par défaut (éditables dans /admin)
@@ -107,6 +107,34 @@ DEFAULT_SCRAPERS = [
             "meta[property='og:image']::content",
             "meta[name='twitter:image']::content",
             ".wsw img::src",
+            "img::src"
+        ],
+        "max_items": 7
+    },
+    {
+        "name": "ArmTimes (HY)",
+        "index_url": "https://www.armtimes.com/hy",
+        "link_selector": "a[href*='/hy/article/'], .article-list a, article h3 a",
+        "title_selector": "h1, .article-title h1",
+        "content_selector": ".article-content, article, .content-article",
+        "image_selectors": [
+            "meta[property='og:image']::content",
+            "meta[name='twitter:image']::content",
+            ".article-content img::src",
+            "img::src"
+        ],
+        "max_items": 7
+    },
+    {
+        "name": "Civic.am",
+        "index_url": "https://civic.am/",
+        "link_selector": "article h2 a, .post-title a, a[href*='/news/']",
+        "title_selector": "h1, .post-title h1",
+        "content_selector": "article .entry-content, .post-content, .article-content, article",
+        "image_selectors": [
+            "meta[property='og:image']::content",
+            "meta[name='twitter:image']::content",
+            "article img::src",
             "img::src"
         ],
         "max_items": 7
@@ -205,8 +233,16 @@ def ensure_signature(body: str) -> str:
         b += "\n\n- Arménie Info"
     return b
 
+# ========= STYLE JOURNALISTIQUE ARMÉNIE INFO (modif INSIDE) =========
 def rewrite_article_fr(title_src: str, raw_text: str):
-    """Retourne (title_fr, body_fr, sure_fr). Pas de '(à traduire)'. Signature unique."""
+    """
+    Retourne (title_fr, body_fr, sure_fr), avec style 'Arménie Info':
+    - français forcé,
+    - 2 à 3 paragraphes courts (phrases courtes, informatif, neutre),
+    - chapeau 1 phrase optionnel au début,
+    - pas de balises HTML, juste du texte,
+    - se termine par: '- Arménie Info' (une seule fois, gérée par ensure_signature).
+    """
     if not raw_text:
         return (title_src or "Actualité", "", False)
 
@@ -215,11 +251,12 @@ def rewrite_article_fr(title_src: str, raw_text: str):
 
     def call_openai():
         prompt = (
-            "Tu es un journaliste francophone. "
-            "Traduis et réécris en FRANÇAIS le Titre et le Corps de l'article ci-dessous. "
-            "Style neutre, informatif. 150–220 mots pour le corps. "
-            "RENVOIE UNIQUEMENT du JSON avec les clés 'title' et 'body'. "
-            "Le 'body' doit être du TEXTE BRUT (pas de balises) et DOIT se terminer par: - Arménie Info.\n\n"
+            "Rôle: rédacteur 'Arménie Info'. "
+            "Objectif: Traduire et réécrire en FRANÇAIS le Titre et le Corps ci-dessous, style journalistique Arménie Info: "
+            "sobre, factuel, clair; phrases courtes; 2 à 3 paragraphes; chapeau (1 phrase) si pertinent; "
+            "aucune exagération; pas d'HTML. "
+            "Renvoie UNIQUEMENT du JSON avec les clés 'title' et 'body'. "
+            "Le 'body' doit être du TEXTE BRUT, avec des sauts de ligne entre les paragraphes, et DOIT finir par: - Arménie Info.\n\n"
             f"Titre (source): {title_src}\n"
             f"Texte (source): {clean_input}"
         )
@@ -227,7 +264,7 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             "model": model or "gpt-4o-mini",
             "temperature": 0.2,
             "messages": [
-                {"role": "system", "content": "Tu écris en français clair et concis. Réponds uniquement au format demandé."},
+                {"role": "system", "content": "Tu écris en français clair, neutre et concis. Respecte strictement le format demandé."},
                 {"role": "user", "content": prompt}
             ]
         }
@@ -236,6 +273,7 @@ def rewrite_article_fr(title_src: str, raw_text: str):
                           json=payload, timeout=60)
         j = r.json()
         out = (j.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+        # JSON strict si possible
         try:
             data = _json.loads(out)
             title_fr = strip_tags(data.get("title","")).strip()
@@ -244,13 +282,23 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             parts = out.split("\n", 1)
             title_fr = strip_tags(parts[0]).strip()
             body_fr  = strip_tags(parts[1] if len(parts) > 1 else "").strip()
+
         if not body_fr:
             body_fr = " ".join(clean_input.split()[:220]).strip()
+
+        # Harmonisation paragraphes : compresse espaces multiples, garde doubles sauts de ligne
+        body_fr = re.sub(r"[ \t]+", " ", body_fr).strip()
+        body_fr = re.sub(r"\n{3,}", "\n\n", body_fr)
+
+        # Signature unique
         body_fr = ensure_signature(body_fr)
+
         if not title_fr:
             title_fr = _title_from_text_fallback(body_fr)
+
         return title_fr, body_fr
 
+    # 2 tentatives si clé présente
     if key:
         try:
             t1, b1 = call_openai()
@@ -259,14 +307,15 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             t2, b2 = call_openai()
             if looks_french(b2) and looks_french(t2):
                 return (t2, b2, True)
+            # Toujours FR forcé, même si modèle hésite
             return (_title_from_text_fallback(b2), ensure_signature(b2), False)
         except Exception as e:
             print(f"[AI] rewrite_article_fr failed: {e}")
 
-    # Fallback local
+    # Fallback local (pas de vraie traduction)
     fr_body = " ".join(strip_tags(raw_text).split()[:220]).strip()
-    fr_title = _title_from_text_fallback(fr_body)
     fr_body = ensure_signature(fr_body)
+    fr_title = _title_from_text_fallback(fr_body)
     return (fr_title, fr_body, False)
 
 # ================== HTTP & IMAGES ==================
@@ -280,9 +329,16 @@ def http_get(url, timeout=20):
     r.encoding = r.encoding or "utf-8"
     return r.text
 
+def _first_from_srcset(val: str):
+    """Prend la première URL d'un attribut srcset si présent."""
+    if not val: return None
+    # format: "url1 320w, url2 640w"
+    parts = [p.strip().split(" ")[0] for p in val.split(",") if p.strip()]
+    return parts[0] if parts else None
+
 def soup_select_attr(soup, selector):
     """
-    Gère les pseudo '::content' (meta/@content) et '::src' (img/@src).
+    Gère '::content' (meta/@content) et '::src' (img/@src).
     Renvoie la première valeur trouvée ou None.
     """
     attr = None
@@ -296,8 +352,12 @@ def soup_select_attr(soup, selector):
         return None
     if attr:
         val = tag.get(attr)
+        if not val and attr == "src":
+            # si pas de src, peut-être srcset
+            val = tag.get("srcset")
+            if val:
+                val = _first_from_srcset(val)
         return val if val else None
-    # sinon, texte
     return tag.get_text(" ", strip=True)
 
 def find_main_image_in_html(html, base_url=None):
@@ -311,12 +371,16 @@ def find_main_image_in_html(html, base_url=None):
     a = soup.find("article")
     if a:
         imgtag = a.find("img")
-        if imgtag and imgtag.get("src"):
-            return urljoin(base_url or "", imgtag["src"])
+        if imgtag:
+            src = imgtag.get("src") or _first_from_srcset(imgtag.get("srcset"))
+            if src:
+                return urljoin(base_url or "", src)
     # fallback: première image
     imgtag = soup.find("img")
-    if imgtag and imgtag.get("src"):
-        return urljoin(base_url or "", imgtag["src"])
+    if imgtag:
+        src = imgtag.get("src") or _first_from_srcset(imgtag.get("srcset"))
+        if src:
+            return urljoin(base_url or "", src)
     return None
 
 def get_image_from_entry(entry, page_html=None, page_url=None):
@@ -333,8 +397,10 @@ def get_image_from_entry(entry, page_html=None, page_url=None):
         if isinstance(enc, list):
             for en in enc:
                 href = en.get("href") if isinstance(en, dict) else None
-                if href and any(href.lower().split("?")[0].endswith(ext) for ext in (".jpg",".jpeg",".png",".webp",".gif")):
-                    return urljoin(page_url or "", href)
+                if href:
+                    base = href.lower().split("?")[0]
+                    if any(base.endswith(ext) for ext in (".jpg",".jpeg",".png",".webp",".gif")):
+                        return urljoin(page_url or "", href)
     except Exception:
         pass
     # 2) img dans le contenu RSS (summary/content)
@@ -351,8 +417,10 @@ def get_image_from_entry(entry, page_html=None, page_url=None):
         if html:
             s = BeautifulSoup(html, "html.parser")
             imgtag = s.find("img")
-            if imgtag and imgtag.get("src"):
-                return urljoin(page_url or "", imgtag["src"])
+            if imgtag:
+                src = imgtag.get("src") or _first_from_srcset(imgtag.get("srcset"))
+                if src:
+                    return urljoin(page_url or "", src)
     # 3) page HTML
     if page_html:
         return find_main_image_in_html(page_html, base_url=page_url)
@@ -636,10 +704,21 @@ def home():
         return page("<h2>Dernières publications</h2><p>Aucune publication pour l’instant.</p>", "Publications")
     cards = []
     for r in rows:
-        img = f"<img src='{r['image_url']}' alt='' style='max-width:100%;height:auto'>" if r["image_url"] else ""
+        img = f"<img src='{r['image_url']}' alt='' style='max-width:100%;height:auto;margin-bottom:0.5rem'>" if r["image_url"] else ""
         created = (r['created_at'] or '')[:16].replace('T',' ')
         body_html = (r['body'] or '').replace("\n", "<br>")
-        cards.append(f"<article><header><h3>{r['title']}</h3><small>{created}</small></header>{img}<p>{body_html}</p></article>")
+        src = r.get('source') or ''
+        link = r.get('orig_link') or ''
+        meta = f"<small style='display:block;margin:.25rem 0;color:#666'>{src}</small>" if src else ""
+        read = f"<p><a href='{link}' target='_blank' rel='noopener'>Lire la source</a></p>" if link else ""
+        cards.append(f"""
+        <article>
+          <header><h3 style="margin-bottom:.25rem">{r['title']}</h3>
+          <small>{created}</small>{meta}</header>
+          {img}
+          <p>{body_html}</p>
+          {read}
+        </article>""")
     return page("<h2>Dernières publications</h2>" + "".join(cards), "Publications")
 
 @app.get("/rss.xml")
@@ -655,8 +734,21 @@ def rss_xml():
         desc  = (r["body"] or "").replace("&","&amp;")
         enclosure = f"<enclosure url='{request.url_root.rstrip('/') + r['image_url']}' type='image/jpeg'/>" if r["image_url"] else ""
         pub   = datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S %z')
-        items.append(f"<item><title>{title}</title><link>{request.url_root}</link><guid isPermaLink='false'>{r['id']}</guid><description><![CDATA[{desc}]]></description>{enclosure}<pubDate>{pub}</pubDate></item>")
-    rss = f"<?xml version='1.0' encoding='UTF-8'?><rss version='2.0'><channel><title>{APP_NAME} — Flux</title><link>{request.url_root}</link><description>Articles publiés</description>{''.join(items)}</channel></rss>"
+        items.append(
+            f"<item><title>{title}</title>"
+            f"<link>{request.url_root}</link>"
+            f"<guid isPermaLink='false'>{r['id']}</guid>"
+            f"<description><![CDATA[{desc}]]></description>"
+            f"{enclosure}<pubDate>{pub}</pubDate></item>")
+    rss = (
+        "<?xml version='1.0' encoding='UTF-8'?>"
+        "<rss version='2.0'><channel>"
+        f"<title>{APP_NAME} — Flux</title>"
+        f"<link>{request.url_root}</link>"
+        "<description>Articles publiés</description>"
+        f"{''.join(items)}"
+        "</channel></rss>"
+    )
     return Response(rss, mimetype="application/rss+xml")
 
 @app.route("/admin", methods=["GET","POST"])
@@ -692,13 +784,17 @@ def admin():
         state_btns = ("<button name='action' value='unpublish' class='secondary'>⏸️ Dépublier</button>"
                       if published else
                       "<button name='action' value='publish' class='secondary'>✅ Publier maintenant</button>")
+        src = r.get('source') or ''
+        link = r.get('orig_link') or ''
+        src_line = f"<small>Source: {src}</small>" if src else ""
+        link_line = f"<small><a href='{link}' target='_blank'>Ouvrir l’article d’origine</a></small>" if link else ""
         return f"""
         <details>
-          <summary><b>{r['title'] or '(Sans titre)'}</b> — <small>{r['status']}</small></summary>
-          {img}
+          <summary><b>{(r['title'] or '(Sans titre)').replace('<','&lt;').replace('>','&gt;')}</b> — <small>{r['status']}</small></summary>
+          {img}<div style="margin:.25rem 0">{src_line} {link_line}</div>
           <form method="post" action="{url_for('save', post_id=r['id'])}">
             <label>Titre<input name="title" value="{(r['title'] or '').replace('"','&quot;')}"></label>
-            <label>Contenu<textarea name="body" rows="6">{r['body'] or ''}</textarea></label>
+            <label>Contenu<textarea name="body" rows="8">{(r['body'] or '').replace('<','&lt;').replace('>','&gt;')}</textarea></label>
             <div class="grid">
               <button name="action" value="save">💾 Enregistrer</button>
               {state_btns}
@@ -756,7 +852,6 @@ def save_settings():
     set_setting("feeds", request.form.get("feeds",""))
     set_setting("default_image_url", request.form.get("default_image_url","").strip())
     scrapers_txt = request.form.get("scrapers_json","").strip()
-    # Valide JSON pour éviter l'erreur "Config sites JSON invalide"
     try:
         _json.loads(scrapers_txt or "[]")
         set_setting("scrapers_json", scrapers_txt or "[]")
