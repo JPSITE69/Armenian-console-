@@ -1,4 +1,3 @@
-app.py â€” Console ArmÃ©nienne (avec gÃ©nÃ©ration d'images brandÃ©es)
 flask import Flask, request, redirect, url_for, Response, render_template_string, session, flash
 sqlite3, os, hashlib, io, traceback, re, threading, time, json as _json
 datetime import datetime, timezone
