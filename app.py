@@ -4,6 +4,8 @@ import sqlite3, os, hashlib, io, traceback, re, threading, time, json as _json
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 import feedparser
 from PIL import Image, UnidentifiedImageError
@@ -14,6 +16,9 @@ ADMIN_PASS = os.environ.get("ADMIN_PASS", "armenie")
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me")
 DB_PATH    = "site.db"
 
+# — Nombre minimum de caractères d’un article pour l’accepter
+MIN_CHARS = 80
+
 # ---- RSS par défaut
 DEFAULT_FEEDS = [
     "https://www.civilnet.am/news/feed/",
@@ -21,9 +26,8 @@ DEFAULT_FEEDS = [
     "https://news.am/eng/rss/",
     "https://factor.am/feed",
     "https://hetq.am/hy/rss",
-    # NE PAS AJOUTER l'API JSON d'Azatutyun ici (ça n'est pas RSS) ; on l'attrape via scraping (voir DEFAULT_SCRAPERS)
-    # Exemple Google News "Arménie" (en anglais) — décommentez si souhaité :
-    # "https://news.google.com/rss/search?q=Armenia&hl=en&gl=US&ceid=US:en",
+    # Google News (Arménie) — utile quand les sites ralentissent
+    "https://news.google.com/rss/search?q=Arm%C3%A9nie&hl=fr&gl=FR&ceid=FR:fr",
 ]
 
 # ---- Scrapers d'index par défaut (éditables dans /admin)
@@ -40,7 +44,7 @@ DEFAULT_SCRAPERS = [
             "article img::src",
             "img::src"
         ],
-        "max_items": 7
+        "max_items": 6
     },
     {
         "name": "Armenpress",
@@ -54,7 +58,7 @@ DEFAULT_SCRAPERS = [
             ".article-content img::src",
             "img::src"
         ],
-        "max_items": 7
+        "max_items": 6
     },
     {
         "name": "News.am (eng)",
@@ -68,7 +72,7 @@ DEFAULT_SCRAPERS = [
             ".article img::src",
             "img::src"
         ],
-        "max_items": 7
+        "max_items": 6
     },
     {
         "name": "Factor.am",
@@ -82,7 +86,7 @@ DEFAULT_SCRAPERS = [
             ".td-post-content img::src",
             "img::src"
         ],
-        "max_items": 7
+        "max_items": 6
     },
     {
         "name": "Hetq (HY)",
@@ -96,7 +100,7 @@ DEFAULT_SCRAPERS = [
             ".article-content img::src",
             "img::src"
         ],
-        "max_items": 7
+        "max_items": 6
     },
     {
         "name": "Azatutyun (RFE/RL)",
@@ -110,13 +114,29 @@ DEFAULT_SCRAPERS = [
             ".wsw img::src",
             "img::src"
         ],
-        "max_items": 7
+        "max_items": 4
     }
 ]
 
 # OpenAI via ENV (écrasé par les paramètres admin si saisis)
 ENV_OPENAI_KEY   = os.environ.get("OPENAI_API_KEY", "").strip()
 ENV_OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+
+# ================== HTTP session (retries) ==================
+def http_session():
+    s = requests.Session()
+    retry = Retry(total=3, backoff_factor=0.6,
+                  status_forcelist=[429, 500, 502, 503, 504],
+                  allowed_methods=["GET", "HEAD"])
+    s.mount("http://", HTTPAdapter(max_retries=retry))
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.headers.update({
+        "User-Agent": "Console-Armenie/1.1 (+https://armenian-console.onrender.com)",
+        "Accept-Language": "fr,en;q=0.8",
+    })
+    return s
+
+HTTP = http_session()
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -150,8 +170,12 @@ def init_db():
         key TEXT PRIMARY KEY,
         value TEXT
     )""")
-    if not column_exists(con, "posts", "publish_at"):
-        con.execute("ALTER TABLE posts ADD COLUMN publish_at TEXT")
+    con.execute("""CREATE TABLE IF NOT EXISTS logs(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        at TEXT,
+        level TEXT,
+        msg TEXT
+    )""")
     con.commit(); con.close()
 
 def get_setting(key, default=""):
@@ -167,6 +191,15 @@ def set_setting(key, value):
     try:
         con.execute("INSERT INTO settings(key,value) VALUES(?,?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        con.commit()
+    finally:
+        con.close()
+
+def log(level, msg):
+    con = db()
+    try:
+        con.execute("INSERT INTO logs(at,level,msg) VALUES(?,?,?)",
+                    (datetime.now(timezone.utc).isoformat(timespec="seconds"), level, msg[:4000]))
         con.commit()
     finally:
         con.close()
@@ -232,9 +265,9 @@ def rewrite_article_fr(title_src: str, raw_text: str):
                 {"role": "user", "content": prompt}
             ]
         }
-        r = requests.post("https://api.openai.com/v1/chat/completions",
-                          headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                          json=payload, timeout=60)
+        r = HTTP.post("https://api.openai.com/v1/chat/completions",
+                      headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                      json=payload, timeout=60)
         j = r.json()
         out = (j.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
         try:
@@ -262,8 +295,9 @@ def rewrite_article_fr(title_src: str, raw_text: str):
                 return (t2, b2, True)
             return (_title_from_text_fallback(b2), ensure_signature(b2), False)
         except Exception as e:
-            print(f"[AI] rewrite_article_fr failed: {e}")
+            log("AI", f"rewrite_article_fr failed: {e}")
 
+    # Fallback local (pas de vraie traduction, mais on produit quelque chose)
     fr_body = " ".join(strip_tags(raw_text).split()[:220]).strip()
     fr_title = _title_from_text_fallback(fr_body)
     fr_body = ensure_signature(fr_body)
@@ -271,36 +305,20 @@ def rewrite_article_fr(title_src: str, raw_text: str):
 
 # ================== HTTP & IMAGES ==================
 def http_get(url, timeout=20):
-    r = requests.get(url, timeout=timeout, allow_redirects=True, headers={
-        "User-Agent": "Mozilla/5.0 (+RenderBot)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "fr,en;q=0.8",
-    })
+    r = HTTP.get(url, timeout=timeout, allow_redirects=True,
+                 headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"})
     r.raise_for_status()
     r.encoding = r.encoding or "utf-8"
     return r.text
 
 def fetch_xml(url, timeout=25):
-    """Télécharge un flux RSS/Atom avec UA propre, renvoie le texte."""
-    r = requests.get(
-        url,
-        timeout=timeout,
-        allow_redirects=True,
-        headers={
-            "User-Agent": "Console-Armenie/1.0 (+https://armenian-console.onrender.com)",
-            "Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, */*;q=0.8",
-            "Accept-Language": "fr,en;q=0.8",
-        },
-    )
+    r = HTTP.get(url, timeout=timeout, allow_redirects=True,
+                 headers={"Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, */*;q=0.8"})
     r.raise_for_status()
     r.encoding = r.encoding or "utf-8"
     return r.text
 
 def soup_select_attr(soup, selector):
-    """
-    Gère les pseudo '::content' (meta/@content) et '::src' (img/@src).
-    Renvoie la première valeur trouvée ou None.
-    """
     attr = None
     sel = selector
     if "::content" in selector:
@@ -370,7 +388,7 @@ def get_image_from_entry(entry, page_html=None, page_url=None):
 def download_image(url):
     if not url: return None, None
     try:
-        r = requests.get(url, timeout=20)
+        r = HTTP.get(url, timeout=20)
         r.raise_for_status()
         data = r.content
         sha1 = hashlib.sha1(data).hexdigest()
@@ -378,7 +396,7 @@ def download_image(url):
             im = Image.open(io.BytesIO(data))
             im.verify()
         except (UnidentifiedImageError, Exception) as e:
-            print(f"[IMG] verify fail {url}: {e}")
+            log("IMG", f"verify fail {url}: {e}")
             return None, None
         os.makedirs("static/images", exist_ok=True)
         path = f"static/images/{sha1}.jpg"
@@ -386,7 +404,7 @@ def download_image(url):
             with open(path, "wb") as f: f.write(data)
         return "/"+path, sha1
     except Exception as e:
-        print(f"[IMG] download failed for {url}: {e}")
+        log("IMG", f"download failed {url}: {e}")
         return None, None
 
 # ================== EXTRACTION TEXTE ==================
@@ -430,7 +448,6 @@ def already_have_link(link: str) -> bool:
 def insert_post(title_fr, body_text, link, source, img_url):
     local_path, sha1 = download_image(img_url) if img_url else (None, None)
     if sha1:
-        # pas de doublon image
         con = db()
         try:
             if con.execute("SELECT 1 FROM posts WHERE image_sha1=?", (sha1,)).fetchone():
@@ -447,7 +464,7 @@ def insert_post(title_fr, body_text, link, source, img_url):
         con.commit()
         return True
     except Exception as e:
-        print("[DB] insert_post error:", e)
+        log("DB", f"insert_post error: {e}")
         return False
     finally:
         con.close()
@@ -460,7 +477,7 @@ def scrape_rss_once(feeds, default_image_url=None):
                 xml = fetch_xml(feed)
                 fp = feedparser.parse(xml)
             except Exception as e:
-                print(f"[FEED] fetch/parse error {feed}: {e}")
+                log("RSS", f"fetch/parse error {feed}: {e}")
                 skipped += 1
                 continue
 
@@ -473,22 +490,20 @@ def scrape_rss_once(feeds, default_image_url=None):
 
                     title_src = (e.get("title") or "(Sans titre)").strip()
 
-                    # page → extraction texte
                     page_html = ""
                     try:
                         page_html = http_get(link)
                     except Exception as ee:
-                        print(f"[PAGE] fetch fail {link}: {ee}")
+                        log("PAGE", f"fetch fail {link}: {ee}")
+
                     article_text = extract_article_text(page_html) if page_html else ""
                     if not article_text:
                         article_text = BeautifulSoup(html_from_entry(e), "html.parser").get_text(" ", strip=True)
-                    if not article_text or len(article_text) < 120:
+                    if not article_text or len(article_text) < MIN_CHARS:
                         skipped += 1; continue
 
-                    # image
                     img_url = get_image_from_entry(e, page_html=page_html, page_url=link) or default_image_url
 
-                    # FR
                     title_fr, body_text, _sure_fr = rewrite_article_fr(title_src, article_text)
                     if not body_text:
                         skipped += 1; continue
@@ -499,10 +514,9 @@ def scrape_rss_once(feeds, default_image_url=None):
                         skipped += 1
                 except Exception as ex:
                     skipped += 1
-                    print(f"[RSS ENTRY] error: {ex}")
-                    traceback.print_exc()
+                    log("RSS ENTRY", f"{feed} -> {ex}\n{traceback.format_exc()}")
         except Exception as e:
-            print(f"[FEED] parse error {feed}: {e}")
+            log("RSS", f"parse error {feed}: {e}")
             continue
     return created, skipped
 
@@ -519,11 +533,11 @@ def scrape_index_once(scrapers_json, default_image_url=None):
             name = cfg.get("name","")
             index_url = cfg["index_url"]
             link_sel  = cfg["link_selector"]
-            max_items = int(cfg.get("max_items", 6))
+            max_items = int(cfg.get("max_items", 5))
             html = http_get(index_url)
             soup = BeautifulSoup(html, "html.parser")
             links = []
-            for a in soup.select(link_sel)[: max_items * 3]:  # un peu large, on dédoublonne ensuite
+            for a in soup.select(link_sel)[: max_items * 3]:
                 href = a.get("href")
                 full = normalize_url(index_url, href)
                 if full and full not in links:
@@ -538,11 +552,9 @@ def scrape_index_once(scrapers_json, default_image_url=None):
                     page = http_get(link)
                     psoup = BeautifulSoup(page, "html.parser")
 
-                    # titre
                     title_sel = cfg.get("title_selector","h1")
                     title_src = soup_select_attr(psoup, title_sel) or "(Sans titre)"
 
-                    # contenu
                     content_sel = cfg.get("content_selector") or ""
                     node_text = ""
                     if content_sel:
@@ -552,22 +564,19 @@ def scrape_index_once(scrapers_json, default_image_url=None):
                             node_text = re.sub(r"\s+", " ", node_text).strip()
                     if not node_text:
                         node_text = extract_article_text(page)
-                    if not node_text or len(node_text) < 120:
+                    if not node_text or len(node_text) < MIN_CHARS:
                         skipped += 1; continue
 
-                    # image
                     img = None
                     for isel in cfg.get("image_selectors", []):
                         val = soup_select_attr(psoup, isel)
                         if val:
-                            img = urljoin(link, val)
-                            break
+                            img = urljoin(link, val); break
                     if not img:
                         img = find_main_image_in_html(page, base_url=link)
                     if not img:
                         img = default_image_url
 
-                    # FR
                     title_fr, body_text, _sure = rewrite_article_fr(title_src, node_text)
                     if not body_text:
                         skipped += 1; continue
@@ -578,9 +587,9 @@ def scrape_index_once(scrapers_json, default_image_url=None):
                         skipped += 1
                 except Exception as inner:
                     skipped += 1
-                    print(f"[SCRAPER:{name}] article error:", inner)
+                    log("SCRAPER ITEM", f"{name} {link} -> {inner}")
         except Exception as e:
-            print("[SCRAPER] config error:", e)
+            log("SCRAPER", f"config error {cfg.get('name','?')}: {e}")
     return created, skipped
 
 # ================== SCHEDULER (publication auto) ==================
@@ -600,11 +609,11 @@ def publish_due_loop():
                         (now, *ids)
                     )
                     con.commit()
-                    print(f"[SCHED] Published IDs: {ids}")
+                    log("SCHED", f"Published IDs: {ids}")
             finally:
                 con.close()
         except Exception as e:
-            print("[SCHED] loop error:", e)
+            log("SCHED", f"loop error: {e}")
         time.sleep(30)
 
 # ================== UI ==================
@@ -620,6 +629,7 @@ LAYOUT = """
     <li><a href="{{ url_for('rss_xml') }}" target="_blank">RSS</a></li>
     {% if session.get('ok') %}
       <li><a href="{{ url_for('admin') }}">Admin</a></li>
+      <li><a href="{{ url_for('logs') }}">Voir les logs</a></li>
       <li><a href="{{ url_for('logout') }}">Déconnexion</a></li>
     {% else %}
       <li><a href="{{ url_for('admin') }}">Connexion</a></li>
@@ -753,9 +763,19 @@ def admin():
         <button>💾 Enregistrer les paramètres</button>
       </form>
 
-      <form method="post" action="{url_for('import_now')}" style="margin-top:1rem">
-        <button type="submit">🔁 Importer maintenant (RSS + Scraping)</button>
-      </form>
+      <div class="grid" style="margin-top:1rem">
+        <form method="post" action="{url_for('import_now_all')}"><button type="submit">🔁 Importer TOUT (RSS + Scrapers)</button></form>
+        <form method="post" action="{url_for('import_only_rss')}"><button type="submit" class="secondary">📡 Import RSS</button></form>
+        <form method="post" action="{url_for('import_only_scrapers')}"><button type="submit" class="secondary">🕷️ Import Scrapers</button></form>
+      </div>
+
+      <details style="margin-top:1rem">
+        <summary>🔎 Tester un flux ou une page</summary>
+        <form method="get" action="{url_for('probe')}">
+          <input name="url" placeholder="https://… (RSS ou page d’index)">
+          <button>Tester</button>
+        </form>
+      </details>
     </article>
 
     <h4>Brouillons</h4>{''.join(card(r) for r in drafts) or "<p>Aucun brouillon.</p>"}
@@ -765,6 +785,48 @@ def admin():
     """
     return page(body, "Admin")
 
+@app.get("/logs")
+def logs():
+    if not session.get("ok"): return redirect(url_for("admin"))
+    con = db()
+    try:
+        rows = con.execute("SELECT * FROM logs ORDER BY id DESC LIMIT 200").fetchall()
+    finally:
+        con.close()
+    lines = "".join(f"<tr><td>{r['at']}</td><td>{r['level']}</td><td style='white-space:pre-wrap'>{r['msg']}</td></tr>" for r in rows)
+    body = f"<h3>Logs</h3><table><thead><tr><th>Quand</th><th>Niveau</th><th>Message</th></tr></thead><tbody>{lines or '<tr><td colspan=3>Aucun log.</td></tr>'}</tbody></table>"
+    return page(body, "Logs")
+
+@app.get("/probe")
+def probe():
+    if not session.get("ok"): return redirect(url_for("admin"))
+    u = request.args.get("url","").strip()
+    if not u:
+        flash("Renseigne un URL (RSS ou page d’index)."); return redirect(url_for("admin"))
+    out = [f"<h3>Probe</h3><p><code>{u}</code></p>"]
+    try:
+        if u.endswith(".xml") or "/rss" in u or "/feed" in u or "news.google.com" in u:
+            xml = fetch_xml(u)
+            fp = feedparser.parse(xml)
+            out.append(f"<p><b>Flux:</b> {fp.feed.get('title','(sans titre)')}</p>")
+            items = []
+            for e in getattr(fp, "entries", [])[:5]:
+                items.append(f"<li><a href='{e.get('link','')}' target='_blank'>{e.get('title','(sans titre)')}</a></li>")
+            out.append("<ul>" + "".join(items) + "</ul>")
+        else:
+            html = http_get(u)
+            soup = BeautifulSoup(html, "html.parser")
+            links = []
+            for a in soup.select("a[href]")[:200]:
+                href = a.get("href")
+                full = urljoin(u, href)
+                if full.startswith("http") and full not in links:
+                    links.append(full)
+            out.append("<p>Quelques liens trouvés :</p><ul>" + "".join(f"<li><a href='{x}' target='_blank'>{x}</a></li>" for x in links[:10]) + "</ul>")
+    except Exception as e:
+        out.append(f"<p style='color:#c00'>Erreur: {e}</p>")
+    return page("".join(out), "Probe")
+
 @app.post("/save-settings")
 def save_settings():
     if not session.get("ok"): return redirect(url_for("admin"))
@@ -773,7 +835,6 @@ def save_settings():
     set_setting("feeds", request.form.get("feeds",""))
     set_setting("default_image_url", request.form.get("default_image_url","").strip())
     scrapers_txt = request.form.get("scrapers_json","").strip()
-    # Valide JSON pour éviter "Config sites JSON invalide"
     try:
         _json.loads(scrapers_txt or "[]")
         set_setting("scrapers_json", scrapers_txt or "[]")
@@ -782,16 +843,29 @@ def save_settings():
         flash(f"Config sites JSON invalide : {e}")
     return redirect(url_for("admin"))
 
-@app.post("/import-now")
-def import_now():
+def _launch_worker(feeds, scrapers, default_image):
+    def worker():
+        try:
+            c1 = s1 = c2 = s2 = 0
+            if feeds:
+                c1, s1 = scrape_rss_once(feeds, default_image_url=default_image)
+            if scrapers:
+                c2, s2 = scrape_index_once(scrapers, default_image_url=default_image)
+            msg = f"OK : {c1+c2} nouveaux, {s1+s2} ignorés."
+            set_setting("last_import_result", msg)
+            log("IMPORT", msg)
+        except Exception as e:
+            msg = f"Erreur : {e}\n{traceback.format_exc()}"
+            set_setting("last_import_result", msg)
+            log("IMPORT", msg)
+    threading.Thread(target=worker, daemon=True).start()
+
+@app.post("/import-all")
+def import_now_all():
     if not session.get("ok"): return redirect(url_for("admin"))
     default_image = get_setting("default_image_url","").strip() or None
-
-    # RSS
     feeds_txt = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
     feed_list = [u.strip() for u in feeds_txt.splitlines() if u.strip()]
-
-    # Scrapers
     try:
         scrapers_cfg = _json.loads(get_setting("scrapers_json", _json.dumps(DEFAULT_SCRAPERS)))
         if not isinstance(scrapers_cfg, list):
@@ -799,25 +873,43 @@ def import_now():
     except Exception as e:
         flash(f"Erreur d’import (sites) : Config sites JSON invalide: {e}")
         return redirect(url_for("admin"))
-
-    # Lance l'import en arrière-plan pour ne pas bloquer la requête HTTP
-    def worker(feeds, scrapers, default_img):
-        try:
-            c1, s1 = scrape_rss_once(feeds, default_image_url=default_img)
-            c2, s2 = scrape_index_once(scrapers, default_image_url=default_img)
-            set_setting("last_import_result", f"OK : {c1+c2} nouveaux, {s1+s2} ignorés.")
-        except Exception as e:
-            msg = f"Erreur : {e}\n{traceback.format_exc()}"
-            print("[IMPORT WORKER] fatal:", msg)
-            set_setting("last_import_result", msg)
-
-    threading.Thread(target=worker, args=(feed_list, scrapers_cfg, default_image), daemon=True).start()
-    flash("Import lancé en arrière-plan. Recharge l’admin dans ~1 minute pour voir le résultat.")
+    _launch_worker(feed_list, scrapers_cfg, default_image)
+    flash("Import TOUT lancé en arrière-plan. Ouvre “Voir les logs” pour suivre.")
     return redirect(url_for("admin"))
+
+@app.post("/import-rss")
+def import_only_rss():
+    if not session.get("ok"): return redirect(url_for("admin"))
+    default_image = get_setting("default_image_url","").strip() or None
+    feeds_txt = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
+    feed_list = [u.strip() for u in feeds_txt.splitlines() if u.strip()]
+    _launch_worker(feed_list, None, default_image)
+    flash("Import RSS lancé en arrière-plan.")
+    return redirect(url_for("admin"))
+
+@app.post("/import-scrapers")
+def import_only_scrapers():
+    if not session.get("ok"): return redirect(url_for("admin"))
+    default_image = get_setting("default_image_url","").strip() or None
+    try:
+        scrapers_cfg = _json.loads(get_setting("scrapers_json", _json.dumps(DEFAULT_SCRAPERS)))
+        if not isinstance(scrapers_cfg, list):
+            raise ValueError("Le JSON de scrapers doit être une liste []")
+    except Exception as e:
+        flash(f"Erreur d’import (sites) : Config sites JSON invalide: {e}")
+        return redirect(url_for("admin"))
+    _launch_worker(None, scrapers_cfg, default_image)
+    flash("Import Scrapers lancé en arrière-plan.")
+    return redirect(url_for("admin"))
+
+# Compatibilité avec le bouton précédent
+@app.post("/import-now")
+def import_now():
+    return import_now_all()
 
 @app.get("/import-now")
 def import_now_get():
-    flash("Utilise le bouton « Importer maintenant » dans l’admin.")
+    flash("Utilise les boutons d’import dans l’admin.")
     return redirect(url_for("admin"))
 
 @app.post("/save/<int:post_id>")
