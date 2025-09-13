@@ -21,8 +21,7 @@ DEFAULT_FEEDS = [
     "https://news.am/eng/rss/",
     "https://factor.am/feed",
     "https://hetq.am/hy/rss",
-    # NB: l'API JSON d'Azatutyun n'est pas un RSS classique, on la couvre via le scraper ci-dessous
-    # "https://www.azatutyun.am/api/zuvvyl-vomx-tpegqkv",
+ 
 ]
 
 # ---- Scrapers d'index par défaut (éditables dans /admin)
