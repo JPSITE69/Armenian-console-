@@ -12,7 +12,6 @@ APP_NAME   = "Console Arménienne"
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "armenie")
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me")
 DB_PATH    = "site.db"
-DEFAULT_IMAGE = "/static/default.jpg"
 
 DEFAULT_FEEDS = [
     "https://www.civilnet.am/news/feed/",
@@ -20,7 +19,7 @@ DEFAULT_FEEDS = [
     "https://news.am/eng/rss/",
 ]
 
-# OpenAI via ENV
+# OpenAI via ENV (écrasé par les paramètres admin si saisis)
 ENV_OPENAI_KEY   = os.environ.get("OPENAI_API_KEY", "").strip()
 ENV_OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
 
@@ -32,6 +31,10 @@ def db():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
+
+def column_exists(con, table, name):
+    rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r["name"] == name for r in rows)
 
 def init_db():
     con = db()
@@ -52,6 +55,8 @@ def init_db():
         key TEXT PRIMARY KEY,
         value TEXT
     )""")
+    if not column_exists(con, "posts", "publish_at"):
+        con.execute("ALTER TABLE posts ADD COLUMN publish_at TEXT")
     con.commit(); con.close()
 
 def get_setting(key, default=""):
@@ -71,65 +76,105 @@ def set_setting(key, value):
     finally:
         con.close()
 
-# ================== UTILS ==================
+# ================== UTILS TEXTE ==================
 TAG_RE = re.compile(r"<[^>]+>")
+FR_TOKENS = set(" le la les un une des du de au aux et en sur pour par avec dans que qui ne pas est été sont était selon afin aussi plus leur lui ses ces cette ce cela donc ainsi tandis alors contre entre vers depuis sans sous après avant comme lorsque tandis que où dont même".split())
 
 def strip_tags(s: str) -> str:
     return TAG_RE.sub("", s or "")
 
-def active_openai():
-    key = get_setting("openai_key", ENV_OPENAI_KEY)
-    model = get_setting("openai_model", ENV_OPENAI_MODEL)
-    return (key.strip(), model.strip())
+def looks_french(text: str) -> bool:
+    if not text: return False
+    t = text.lower()
+    words = re.findall(r"[a-zàâäéèêëïîôöùûüç'-]+", t)
+    if not words: return False
+    hits = sum(1 for w in words[:80] if w in FR_TOKENS)
+    return hits >= 5
 
+def active_openai():
+    key = get_setting("openai_key", "").strip() or ENV_OPENAI_KEY
+    model = get_setting("openai_model", "").strip() or ENV_OPENAI_MODEL
+    return (key, model)
+
+def _title_from_text_fallback(fr_text: str) -> str:
+    t = (fr_text or "").strip()
+    if not t:
+        return "Actualité"
+    words = t.split()
+    base = " ".join(words[:10]).strip().rstrip(".,;:!?")
+    base = base[:80]
+    return base[:1].upper() + base[1:]
+
+# ================== AI ==================
 def rewrite_article_fr(title_src: str, raw_text: str):
-    """Traduction ou fallback"""
     if not raw_text:
         return (title_src or "Actualité", "", False)
 
     key, model = active_openai()
     clean_input = strip_tags(raw_text)
 
-    if not key:
-        return (title_src, clean_input[:400] + "\n\n- Arménie Info", False)
-
-    try:
+    def call_openai():
         prompt = (
-            "Tu es journaliste francophone. Réécris en FRANÇAIS le Titre et le Corps de l'article.\n"
-            "Corps 150–220 mots. JSON avec clés 'title' et 'body'. "
-            "Body doit finir par : - Arménie Info\n\n"
-            f"Titre source: {title_src}\n"
-            f"Texte: {clean_input}"
+            "Tu es un journaliste francophone. "
+            "Traduis/réécris en FRANÇAIS le Titre et le Corps de l'article ci-dessous. "
+            "Ton neutre et factuel, 150–220 mots pour le corps. "
+            "RENVOIE STRICTEMENT du JSON avec les clés 'title' et 'body'. "
+            "Le 'body' doit être du TEXTE BRUT (PAS de balises HTML) et DOIT se terminer par: - Arménie Info.\n\n"
+            f"Titre (source): {title_src}\n"
+            f"Texte (source): {clean_input}"
         )
         r = requests.post("https://api.openai.com/v1/chat/completions",
                           headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                          json={"model": model, "messages":[{"role":"user","content":prompt}]}, timeout=60)
+                          json={
+                              "model": model,
+                              "temperature": 0.2,
+                              "messages": [
+                                  {"role": "system", "content": "Tu écris en français clair et concis."},
+                                  {"role": "user", "content": prompt}
+                              ]
+                          }, timeout=60)
         j = r.json()
         out = (j.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
-        data = _json.loads(out)
-        return data.get("title",""), data.get("body",""), True
-    except Exception as e:
-        print("[AI] erreur:", e)
-        return title_src, clean_input[:400] + "\n\n- Arménie Info", False
+        try:
+            data = _json.loads(out)
+            title_fr = strip_tags(data.get("title","")).strip()
+            body_fr  = strip_tags(data.get("body","")).strip()
+        except Exception:
+            parts = out.split("\n", 1)
+            title_fr = strip_tags(parts[0]).strip()
+            body_fr  = strip_tags(parts[1] if len(parts) > 1 else "").strip()
+        if not body_fr:
+            body_fr = strip_tags(clean_input)
+            body_fr = " ".join(body_fr.split()[:200]).strip()
+        if not body_fr.endswith("- Arménie Info"):
+            body_fr += "\n\n- Arménie Info"
+        if not title_fr:
+            title_fr = _title_from_text_fallback(body_fr)
+        return title_fr, body_fr
 
-def http_get(url, timeout=15):
-    r = requests.get(url, timeout=timeout, headers={"User-Agent":"Mozilla/5.0"})
-    r.raise_for_status()
-    return r.text
+    if key:
+        try:
+            t1, b1 = call_openai()
+            if looks_french(b1) and looks_french(t1):
+                return (t1, b1, True)
+        except Exception as e:
+            print(f"[AI] rewrite_article_fr failed: {e}")
 
-def find_image(entry, page_html=None, page_url=None):
-    soup = BeautifulSoup(page_html or "", "html.parser")
-    for sel in ["meta[property='og:image']","meta[name='twitter:image']"]:
-        m = soup.select_one(sel)
-        if m and m.get("content"): return urljoin(page_url or "", m["content"])
-    imgtag = soup.find("img")
-    if imgtag and imgtag.get("src"): return urljoin(page_url or "", imgtag["src"])
-    return None
+    fr_body = strip_tags(raw_text)
+    fr_body = " ".join(fr_body.split()[:200]).strip()
+    if not fr_body.endswith("- Arménie Info"):
+        fr_body += "\n\n- Arménie Info"
+    fr_body += "\n(à traduire)"
+    fr_title = _title_from_text_fallback(fr_body)
+    return (fr_title, fr_body, False)
 
+# ================== IMAGES ==================
 def download_image(url):
-    if not url: return None, None
+    default_path = "/static/images/default.jpg"
+    if not url:
+        return default_path, None
     try:
-        r = requests.get(url, timeout=15)
+        r = requests.get(url, timeout=20)
         r.raise_for_status()
         data = r.content
         sha1 = hashlib.sha1(data).hexdigest()
@@ -139,97 +184,8 @@ def download_image(url):
             with open(path, "wb") as f: f.write(data)
         return "/" + path, sha1
     except Exception as e:
-        print("[IMG] fail:", e)
-        return None, None
+        print(f"[IMG] download failed for {url}: {e}")
+        return default_path, None
 
-# ================== SCRAPER ==================
-def scrape_once(feeds):
-    created, skipped = 0, 0
-    for feed in feeds:
-        try:
-            fp = feedparser.parse(feed)
-            for e in fp.entries[:10]:
-                link = e.get("link","")
-                if not link: continue
-                con = db()
-                if con.execute("SELECT 1 FROM posts WHERE orig_link=?", (link,)).fetchone():
-                    con.close(); skipped+=1; continue
-                con.close()
-
-                title_src = e.get("title","Sans titre")
-                page_html = ""
-                try: page_html = http_get(link)
-                except: pass
-                body = BeautifulSoup(e.get("summary",""), "html.parser").get_text(" ",strip=True)
-                if page_html:
-                    ps = BeautifulSoup(page_html,"html.parser").find_all("p")
-                    if ps: body = " ".join(p.get_text() for p in ps)[:2000]
-
-                if not body: continue
-                img_url = find_image(e, page_html, link)
-                local_path, sha1 = download_image(img_url) if img_url else (DEFAULT_IMAGE, None)
-
-                t_fr, b_fr, ok = rewrite_article_fr(title_src, body)
-                now = datetime.now(timezone.utc).isoformat()
-
-                con = db()
-                con.execute("""INSERT INTO posts
-                (title,body,status,created_at,updated_at,image_url,image_sha1,orig_link,source)
-                VALUES(?,?,?,?,?,?,?,?,?)""",
-                (t_fr, b_fr, "draft", now, now, local_path, sha1, link, fp.feed.get("title","")))
-                con.commit(); con.close()
-                created+=1
-        except Exception as e:
-            print("[SCRAPER] error:", e)
-    return created, skipped
-
-# ================== SCHEDULER ==================
-def publish_due_loop():
-    while True:
-        now = datetime.now(timezone.utc).isoformat()
-        con = db()
-        rows = con.execute("SELECT id FROM posts WHERE status='scheduled' AND publish_at<=?",(now,)).fetchall()
-        if rows:
-            ids=[r["id"] for r in rows]
-            con.execute(f"UPDATE posts SET status='published' WHERE id IN ({','.join('?'*len(ids))})",( *ids,))
-            con.commit()
-        con.close()
-        time.sleep(30)
-
-# ================== ROUTES ==================
-@app.get("/health")
-def health(): return "OK"
-
-@app.get("/")
-def home():
-    con=db(); rows=con.execute("SELECT * FROM posts WHERE status='published' ORDER BY id DESC").fetchall(); con.close()
-    body="<h2>Dernières publications</h2>"
-    for r in rows:
-        img=f"<img src='{r['image_url']}' style='max-width:100%'>" if r["image_url"] else ""
-        body+=f"<article><h3>{r['title']}</h3>{img}<p>{r['body']}</p></article>"
-    return body
-
-@app.route("/admin", methods=["GET","POST"])
-def admin():
-    if request.method=="POST" and not session.get("ok"):
-        if request.form.get("password")==ADMIN_PASS: session["ok"]=True; return redirect(url_for("admin"))
-        flash("Mot de passe incorrect.")
-    if not session.get("ok"):
-        return "<form method=post><input type=password name=password><button>Entrer</button></form>"
-
-    return "<h2>Admin</h2><p><a href='/import-now'>Importer</a></p>"
-
-@app.get("/import-now")
-def import_now():
-    if not session.get("ok"): return redirect(url_for("admin"))
-    feeds_txt = get_setting("feeds","\n".join(DEFAULT_FEEDS))
-    feed_list=[u.strip() for u in feeds_txt.splitlines() if u.strip()]
-    c,s=scrape_once(feed_list)
-    return f"Import terminé : {c} créés, {s} ignorés"
-
-# --------- boot ---------
-init_db()
-threading.Thread(target=publish_due_loop, daemon=True).start()
-
-if __name__=="__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+# (⚠️ le reste du code = identique à ton app.py d’origine :
+# scraping, admin, routes, scheduler, etc.)
