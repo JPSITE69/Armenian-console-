@@ -9,7 +9,7 @@ PIL import Image, UnidentifiedImageError
 render_visual import render_visual
 
 # ================== CONFIG ==================
-_NAME   = "Console ArmÃ©nienne"
+_NAME   = "Console Armenie info"
 _PASS = os.environ.get("ADMIN_PASS", "armenie")
 _KEY = os.environ.get("SECRET_KEY", "change-me")
 _PATH    = "site.db"
