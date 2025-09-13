@@ -8,7 +8,7 @@ import feedparser
 from PIL import Image, UnidentifiedImageError
 
 # ================== CONFIG ==================
-APP_NAME   = "Console Arménienne"
+APP_NAME   = "Console ArmÃ©nienne"
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "armenie")
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me")
 DB_PATH    = "site.db"
@@ -24,7 +24,7 @@ DEFAULT_FEEDS = [
     "https://www.armtimes.com/hy/rss",
 ]
 
-# OpenAI via ENV
+# OpenAI via ENV (Ã©crasÃ© par les paramÃ¨tres admin si saisis)
 ENV_OPENAI_KEY   = os.environ.get("OPENAI_API_KEY", "").strip()
 ENV_OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
 
@@ -83,7 +83,7 @@ def set_setting(key, value):
 
 # ================== UTILS TEXTE ==================
 TAG_RE = re.compile(r"<[^>]+>")
-FR_TOKENS = set(" le la les un une des du de au aux et en sur pour par avec dans que qui ne pas est été sont était selon afin aussi plus leur lui ses ces cette ce cela donc ainsi tandis alors contre entre vers depuis sans sous après avant comme lorsque tandis que où dont même".split())
+FR_TOKENS = set(" le la les un une des du de au aux et en sur pour par avec dans que qui ne pas est Ã©tÃ© sont Ã©tait selon afin aussi plus leur lui ses ces cette ce cela donc ainsi tandis alors contre entre vers depuis sans sous aprÃ¨s avant comme lorsque tandis que oÃ¹ dont mÃªme".split())
 
 def strip_tags(s: str) -> str:
     return TAG_RE.sub("", s or "")
@@ -91,7 +91,7 @@ def strip_tags(s: str) -> str:
 def looks_french(text: str) -> bool:
     if not text: return False
     t = text.lower()
-    words = re.findall(r"[a-zàâäéèêëïîôöùûüç'-]+", t)
+    words = re.findall(r"[a-zÃ Ã¢Ã¤Ã©Ã¨ÃªÃ«Ã¯Ã®Ã´Ã¶Ã¹Ã»Ã¼Ã§'-]+", t)
     if not words: return False
     hits = sum(1 for w in words[:80] if w in FR_TOKENS)
     return hits >= 5
@@ -104,7 +104,7 @@ def active_openai():
 def _title_from_text_fallback(fr_text: str) -> str:
     t = (fr_text or "").strip()
     if not t:
-        return "Actualité"
+        return "ActualitÃ©"
     words = t.split()
     base = " ".join(words[:10]).strip().rstrip(".,;:!?")
     base = base[:80]
@@ -112,18 +112,18 @@ def _title_from_text_fallback(fr_text: str) -> str:
 
 def rewrite_article_fr(title_src: str, raw_text: str):
     if not raw_text:
-        return (title_src or "Actualité", "", False)
+        return (title_src or "ActualitÃ©", "", False)
 
     key, model = active_openai()
     clean_input = strip_tags(raw_text)
 
     def call_openai():
         prompt = (
-            "Tu es un journaliste d’Arménie Info. "
-            "Réécris en FRANÇAIS journalistique le titre et le corps de l’article ci-dessous. "
-            "Style neutre, clair et factuel, 180–250 mots. "
-            "Ajoute des paragraphes pour la lisibilité. "
-            "Le texte doit se terminer par : - Arménie Info.\n\n"
+            "Tu es un journaliste dâ€™ArmÃ©nie Info. "
+            "RÃ©Ã©cris en FRANÃ‡AIS journalistique le titre et le corps de lâ€™article ci-dessous. "
+            "Style neutre, clair et factuel, 180â€“250 mots. "
+            "Ajoute des paragraphes pour la lisibilitÃ©. "
+            "Le texte doit se terminer par : - ArmÃ©nie Info.\n\n"
             f"Titre (source): {title_src}\n"
             f"Texte (source): {clean_input}"
         )
@@ -131,7 +131,7 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             "model": model or "gpt-4o-mini",
             "temperature": 0.2,
             "messages": [
-                {"role": "system", "content": "Tu écris en français journalistique et clair. Réponds uniquement au format demandé."},
+                {"role": "system", "content": "Tu Ã©cris en franÃ§ais journalistique et clair. RÃ©ponds uniquement au format demandÃ©."},
                 {"role": "user", "content": prompt}
             ]
         }
@@ -140,6 +140,7 @@ def rewrite_article_fr(title_src: str, raw_text: str):
                           json=payload, timeout=60)
         j = r.json()
         out = (j.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+        # Essai de JSON (facultatif)
         try:
             data = _json.loads(out)
             title_fr = strip_tags(data.get("title","")).strip()
@@ -150,8 +151,8 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             body_fr  = strip_tags(parts[1] if len(parts) > 1 else "").strip()
         if not body_fr:
             body_fr = " ".join(clean_input.split()[:200])
-        if not body_fr.endswith("- Arménie Info"):
-            body_fr += "\n\n- Arménie Info"
+        if not body_fr.endswith("- ArmÃ©nie Info"):
+            body_fr += "\n\n- ArmÃ©nie Info"
         if not title_fr:
             title_fr = _title_from_text_fallback(body_fr)
         return title_fr, body_fr
@@ -165,16 +166,19 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             t2, b2 = call_openai()
             if looks_french(b2) and looks_french(t2):
                 return (t2, b2, True)
-            b2 += "\n\n- Arménie Info"
+            b2 = (b2 or " ").rstrip()
+            if not b2.endswith("- ArmÃ©nie Info"):
+                b2 += "\n\n- ArmÃ©nie Info"
             return (_title_from_text_fallback(b2), b2, False)
         except Exception as e:
             print(f"[AI] rewrite_article_fr failed: {e}")
 
     fr_body = " ".join(strip_tags(raw_text).split()[:200])
-    if not fr_body.endswith("- Arménie Info"):
-        fr_body += "\n\n- Arménie Info"
+    if not fr_body.endswith("- ArmÃ©nie Info"):
+        fr_body += "\n\n- ArmÃ©nie Info"
     fr_title = _title_from_text_fallback(fr_body)
     return (fr_title, fr_body, False)
+
 # ================== HTTP & IMAGES ==================
 def http_get(url, timeout=20):
     r = requests.get(url, timeout=timeout, allow_redirects=True, headers={
@@ -290,7 +294,8 @@ def html_from_entry(entry):
         if isinstance(entry.content, list): return entry.content[0].get("value","")
         if isinstance(entry.content, dict): return entry.content.get("value","")
     return entry.get("summary","") or entry.get("description","")
-    # ================== SCRAPE ==================
+
+# ================== SCRAPE ==================
 def scrape_once(feeds):
     created, skipped = 0, 0
     for feed in feeds:
@@ -306,7 +311,7 @@ def scrape_once(feeds):
                 if not link:
                     skipped += 1; continue
 
-                # doublon
+                # doublon par lien
                 con = db()
                 try:
                     if con.execute("SELECT 1 FROM posts WHERE orig_link=?", (link,)).fetchone():
@@ -316,7 +321,7 @@ def scrape_once(feeds):
 
                 title_src = (e.get("title") or "(Sans titre)").strip()
 
-                # page → extraction texte
+                # page â†’ extraction texte
                 page_html = ""
                 try:
                     page_html = http_get(link)
@@ -328,7 +333,7 @@ def scrape_once(feeds):
                 if not article_text or len(article_text) < 120:
                     skipped += 1; continue
 
-                # image
+                # image : RSS d'abord, puis page
                 img_url = get_image_from_entry(e, page_html=page_html, page_url=link) or None
                 if not img_url and feed_link:
                     img_url = get_image_from_entry(e, page_html=page_html, page_url=feed_link)
@@ -341,13 +346,13 @@ def scrape_once(feeds):
                     finally:
                         con.close()
 
-                # traduction
+                # TITRE + TEXTE EN FR (robuste)
                 title_fr, body_text, sure_fr = rewrite_article_fr(title_src, article_text)
                 if not body_text:
                     skipped += 1; continue
 
                 now = datetime.now(timezone.utc).isoformat()
-                status = "draft"
+                status = "draft"  # validation manuelle dans l'admin
 
                 con = db()
                 try:
@@ -361,11 +366,11 @@ def scrape_once(feeds):
                     con.close()
             except Exception as e:
                 skipped += 1
-                print(f"[ENTRY] skipped: {e}")
+                print(f"[ENTRY] skipped due to error: {e}")
                 traceback.print_exc()
     return created, skipped
 
-# ================== SCHEDULER ==================
+# ================== SCHEDULER (publication auto) ==================
 def publish_due_loop():
     while True:
         try:
@@ -402,7 +407,7 @@ LAYOUT = """
     <li><a href="{{ url_for('rss_xml') }}" target="_blank">RSS</a></li>
     {% if session.get('ok') %}
       <li><a href="{{ url_for('admin') }}">Admin</a></li>
-      <li><a href="{{ url_for('logout') }}">Déconnexion</a></li>
+      <li><a href="{{ url_for('logout') }}">DÃ©connexion</a></li>
     {% else %}
       <li><a href="{{ url_for('admin') }}">Connexion</a></li>
     {% endif %}
@@ -412,11 +417,15 @@ LAYOUT = """
   {% with m=get_flashed_messages() %}{% if m %}<article>{% for x in m %}<p>{{x}}</p>{% endfor %}</article>{% endif %}{% endwith %}
   {{ body|safe }}
 </main>
-<footer><small>&copy; {{year}} — {{appname}}</small></footer>
+<footer><small>&copy; {{year}} â€” {{appname}}</small></footer>
 </body>"""
 def page(body, title=""):
     return render_template_string(LAYOUT, body=body, title=title or APP_NAME,
                                  appname=APP_NAME, year=datetime.now().year)
+
+@app.get("/health")
+def health():
+    return "OK"
 
 @app.get("/")
 def home():
@@ -426,14 +435,14 @@ def home():
     finally:
         con.close()
     if not rows:
-        return page("<h2>Dernières publications</h2><p>Aucune publication pour l’instant.</p>", "Publications")
+        return page("<h2>DerniÃ¨res publications</h2><p>Aucune publication pour lâ€™instant.</p>", "Publications")
     cards = []
     for r in rows:
         img = f"<img src='{r['image_url']}' alt='' style='max-width:100%;height:auto'>" if r["image_url"] else ""
         created = (r['created_at'] or '')[:16].replace('T',' ')
         body_html = (r['body'] or '').replace("\n", "<br>")
         cards.append(f"<article><header><h3>{r['title']}</h3><small>{created}</small></header>{img}<p>{body_html}</p></article>")
-    return page("<h2>Dernières publications</h2>" + "".join(cards), "Publications")
+    return page("<h2>DerniÃ¨res publications</h2>" + "".join(cards), "Publications")
 
 @app.get("/rss.xml")
 def rss_xml():
@@ -449,7 +458,7 @@ def rss_xml():
         enclosure = f"<enclosure url='{request.url_root.rstrip('/') + r['image_url']}' type='image/jpeg'/>" if r["image_url"] else ""
         pub   = datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S %z')
         items.append(f"<item><title>{title}</title><link>{request.url_root}</link><guid isPermaLink='false'>{r['id']}</guid><description><![CDATA[{desc}]]></description>{enclosure}<pubDate>{pub}</pubDate></item>")
-    rss = f"<?xml version='1.0' encoding='UTF-8'?><rss version='2.0'><channel><title>{APP_NAME} — Flux</title><link>{request.url_root}</link><description>Articles publiés</description>{''.join(items)}</channel></rss>"
+    rss = f"<?xml version='1.0' encoding='UTF-8'?><rss version='2.0'><channel><title>{APP_NAME} â€” Flux</title><link>{request.url_root}</link><description>Articles publiÃ©s</description>{''.join(items)}</channel></rss>"
     return Response(rss, mimetype="application/rss+xml")
 
 @app.route("/admin", methods=["GET","POST"])
@@ -480,54 +489,56 @@ def admin():
     def card(r, published=False):
         img = f"<img src='{r['image_url']}' style='max-width:200px'>" if r["image_url"] else ""
         pub_at = (r['publish_at'] or '')[:16]
-        state_btns = ("<button name='action' value='unpublish' class='secondary'>⏸️ Dépublier</button>"
+
                       if published else
-                      "<button name='action' value='publish' class='secondary'>✅ Publier</button>")
+                      "<button name='action' value='publish' class='secondary'>âœ… Publier maintenant</button>")
         return f"""
         <details>
-          <summary><b>{r['title'] or '(Sans titre)'}</b> — <small>{r['status']}</small></summary>
+          <summary><b>{r['title'] or '(Sans titre)'}</b> â€” <small>{r['status']}</small></summary>
           {img}
           <form method="post" action="{url_for('save', post_id=r['id'])}">
             <label>Titre<input name="title" value="{(r['title'] or '').replace('"','&quot;')}"></label>
             <label>Contenu<textarea name="body" rows="6">{r['body'] or ''}</textarea></label>
             <div class="grid">
-              <button name="action" value="save">💾 Enregistrer</button>
+              <button name="action" value="save">ðŸ’¾ Enregistrer</button>
               {state_btns}
-              <button name="action" value="delete" class="contrast">🗑️ Supprimer</button>
+
             </div>
-            <label>Publier à (UTC)
+            <label>Publier Ã  (UTC)
               <input type="datetime-local" name="publish_at" value="{pub_at}">
             </label>
             <div class="grid">
-              <button name="action" value="schedule" class="secondary">🕒 Planifier</button>
+              <button name="action" value="schedule" class="secondary">ðŸ•’ Planifier</button>
             </div>
           </form>
         </details>"""
 
     body = f"""
-    <h3>Paramètres</h3>
+    <h3>ParamÃ¨tres</h3>
     <article>
       <form method="post" action="{url_for('save_settings')}">
         <div class="grid">
-          <label>OpenAI API Key
-            <input type="password" name="openai_key" value="{openai_key}">
+          <label>OpenAI API Key (prioritÃ© base)
+            <input type="password" name="openai_key" placeholder="sk-..." value="{openai_key}">
           </label>
           <label>OpenAI Model
-            <input name="openai_model" value="{openai_model}">
+            <input name="openai_model" placeholder="gpt-4o-mini" value="{openai_model}">
           </label>
         </div>
-        <label>Sources RSS
+        <label>Sources RSS (une URL par ligne)
           <textarea name="feeds" rows="6">{feeds}</textarea>
         </label>
-        <button>💾 Enregistrer</button>
+        <button>ðŸ’¾ Enregistrer les paramÃ¨tres</button>
       </form>
       <form method="post" action="{url_for('import_now')}" style="margin-top:1rem">
-        <button type="submit">🔁 Importer maintenant</button>
+
       </form>
     </article>
+
     <h4>Brouillons</h4>{''.join(card(r) for r in drafts) or "<p>Aucun brouillon.</p>"}
-    <h4>Planifiés</h4>{''.join(card(r) for r in scheduled) or "<p>Aucun article planifié.</p>"}
-    <h4>Publiés</h4>{''.join(card(r, True) for r in pubs) or "<p>Rien de publié.</p>"}
+    <h4>PlanifiÃ©s</h4>{''.join(card(r) for r in scheduled) or "<p>Aucun article planifiÃ©.</p>"}
+    <h4>PubliÃ©s</h4>{''.join(card(r, True) for r in pubs) or "<p>Rien de publiÃ©.</p>"}
+    <p>Flux public : <code>{request.url_root}rss.xml</code></p>
     """
     return page(body, "Admin")
 
@@ -537,7 +548,7 @@ def save_settings():
     set_setting("openai_key", request.form.get("openai_key","").strip())
     set_setting("openai_model", request.form.get("openai_model","").strip())
     set_setting("feeds", request.form.get("feeds",""))
-    flash("Paramètres enregistrés.")
+    flash("ParamÃ¨tres enregistrÃ©s.")
     return redirect(url_for("admin"))
 
 @app.post("/import-now")
@@ -546,15 +557,20 @@ def import_now():
     feeds_txt = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
     feed_list = [u.strip() for u in feeds_txt.splitlines() if u.strip()]
     if not feed_list:
-        flash("Aucune source RSS configurée.")
+        flash("Aucune source RSS configurÃ©e.")
         return redirect(url_for("admin"))
     try:
         created, skipped = scrape_once(feed_list)
-        flash(f"Import terminé : {created} nouveaux, {skipped} ignorés.")
+        flash(f"Import terminÃ© : {created} nouveaux, {skipped} ignorÃ©s.")
     except Exception as e:
         print("[IMPORT] fatal:", e)
         traceback.print_exc()
-        flash(f"Erreur d’import : {e}")
+        flash(f"Erreur dâ€™import : {e}")
+    return redirect(url_for("admin"))
+
+@app.get("/import-now")
+def import_now_get():
+    flash("Utilise le bouton Â« Importer maintenant Â» dans lâ€™admin.")
     return redirect(url_for("admin"))
 
 @app.post("/save/<int:post_id>")
@@ -565,8 +581,8 @@ def save(post_id):
     body       = strip_tags(request.form.get("body","").strip())
     publish_at = request.form.get("publish_at","").strip()
 
-    if body and not body.rstrip().endswith("- Arménie Info"):
-        body = body.rstrip() + "\n\n- Arménie Info"
+    if body and not body.rstrip().endswith("- ArmÃ©nie Info"):
+        body = body.rstrip() + "\n\n- ArmÃ©nie Info"
 
     con = db()
     try:
@@ -574,10 +590,10 @@ def save(post_id):
                     (title, body, datetime.now(timezone.utc).isoformat(timespec="minutes"), post_id))
         if action == "publish":
             con.execute("UPDATE posts SET status='published', publish_at=NULL WHERE id=?", (post_id,))
-            flash("Publié immédiatement.")
+            flash("PubliÃ© immÃ©diatement.")
         elif action == "unpublish":
             con.execute("UPDATE posts SET status='draft', publish_at=NULL WHERE id=?", (post_id,))
-            flash("Dépublié.")
+            flash("DÃ©publiÃ©.")
         elif action == "schedule":
             if not publish_at:
                 flash("Choisis une date/heure (UTC) pour planifier.")
@@ -585,12 +601,12 @@ def save(post_id):
                 iso_utc = publish_at if len(publish_at) == 16 else publish_at[:16]
                 iso_utc += ":00+00:00" if len(iso_utc) == 16 else ""
                 con.execute("UPDATE posts SET status='scheduled', publish_at=? WHERE id=?", (iso_utc, post_id))
-                flash(f"Planifié pour {iso_utc}.")
+                flash(f"PlanifiÃ© pour {iso_utc} (UTC).")
         elif action == "delete":
             con.execute("DELETE FROM posts WHERE id=?", (post_id,))
-            flash("Supprimé.")
+            flash("SupprimÃ©.")
         else:
-            flash("Enregistré.")
+            flash("EnregistrÃ©.")
         con.commit()
     finally:
         con.close()
