@@ -1,4 +1,4 @@
-# app.py — Console Arménienne (auto-import + auto-publish + image obligatoire + titres propres + clé OpenAI une fois)
+# app.py — Console Arménienne (auto-import + auto-publish + image obligatoire + titres propres + >=120 mots + clé OpenAI persistée)
 from flask import Flask, request, redirect, url_for, Response, render_template_string, session, flash
 import sqlite3, os, hashlib, io, traceback, re, threading, time, json as _json
 from datetime import datetime, timezone
@@ -18,6 +18,10 @@ DB_PATH    = "site.db"
 AUTO_PUBLISH = True          # Publie immédiatement tout nouvel article
 REQUIRE_IMAGE = True         # Photo obligatoire
 IMPORT_INTERVAL_MIN = int(os.environ.get("IMPORT_INTERVAL_MIN", "10"))  # boucle auto (minutes)
+
+# Cibles de longueur
+TARGET_MIN_WORDS = int(os.environ.get("TARGET_MIN_WORDS", "120"))  # minimum strict demandé
+TARGET_MAX_WORDS = int(os.environ.get("TARGET_MAX_WORDS", "420"))  # borne haute de secours (souple)
 
 # ---- RSS par défaut
 DEFAULT_FEEDS = [
@@ -269,8 +273,88 @@ def ensure_signature(body: str) -> str:
         b += "\n\n- LesArmeniens.com"
     return b
 
+# ------- Helpers longueur >= 120 et titre basé contenu -------
+STOP_FR = set("""
+le la les un une des du de au aux en sur pour par avec dans que qui ne pas est été
+sont était selon afin aussi plus leur lui ses ces cette ce cela donc ainsi tandis
+alors contre entre vers depuis sans sous après avant comme lorsque où dont même
+""".split())
+
+def _tokenize_words(text: str) -> list[str]:
+    return re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9'’\-]+", (text or "").lower())
+
+def _word_count(text: str) -> int:
+    return len(_tokenize_words(text))
+
+def ensure_min_words(body_text: str, source_text: str, min_words: int = TARGET_MIN_WORDS) -> str:
+    """
+    Si body_text < min_words, on complète avec du texte propre issu de source_text.
+    On respecte la signature - LesArmeniens.com (pas de doublon).
+    """
+    body = (body_text or "").strip()
+    sig = "- LesArmeniens.com"
+    if body.endswith(sig):
+        body = body[:-len(sig)].rstrip()
+
+    if _word_count(body) >= min_words:
+        return ensure_signature(body)
+
+    # Complément depuis la source
+    src_clean = strip_tags(source_text or "")
+    # évite de re-coller du déjà présent
+    extra = " ".join([w for w in src_clean.split() if w not in set(body.split())])
+    if not extra:
+        extra = src_clean
+
+    # on complète jusqu'à min_words sans dépasser de beaucoup
+    body_words = _tokenize_words(body)
+    extra_words = _tokenize_words(extra)
+    need = max(0, min_words - len(body_words))
+    if need > 0 and extra_words:
+        # on ajoute ~10% de marge douce
+        take = min(len(extra_words), int(need * 1.2))
+        body = (body + " " + " ".join(extra_words[:take])).strip()
+
+    # borne haute de sécurité
+    if _word_count(body) > TARGET_MAX_WORDS:
+        body = " ".join(_tokenize_words(body)[:TARGET_MAX_WORDS])
+
+    return ensure_signature(body)
+
+def title_relevance_score(title: str, body_text: str) -> float:
+    """
+    Score très simple : proportion de mots significatifs du titre qui apparaissent dans le corps.
+    """
+    tw = [w for w in _tokenize_words(title) if w not in STOP_FR]
+    if not tw:
+        return 0.0
+    bw = set([w for w in _tokenize_words(body_text) if w not in STOP_FR])
+    hits = sum(1 for w in tw if w in bw)
+    return hits / max(1, len(tw))
+
+def derive_title_from_body(body_text: str, min_len: int = 6, max_len: int = 14) -> str:
+    """
+    Fallback de titre basé contenu : top mots (hors stopwords), recollés en 6–14 mots lisibles,
+    puis normalisés. Basique mais robuste si l’IA titre mal.
+    """
+    words = [w for w in _tokenize_words(body_text) if w not in STOP_FR]
+    if not words:
+        return "Actualité"
+    # fréquences
+    freq = {}
+    for w in words:
+        freq[w] = freq.get(w, 0) + 1
+    ranked = sorted(freq.items(), key=lambda kv: (kv[1], len(kv[0])), reverse=True)
+    top = [w for (w, c) in ranked[:max_len]]
+    if len(top) < min_len:
+        top = (top + words[:min_len])[:min_len]
+    raw = " ".join(top[:max_len])
+    return normalize_title(raw)
+
+# ================== RÉÉCRITURE ==================
 def rewrite_article_fr(title_src: str, raw_text: str):
-    """Retourne (title_fr, body_fr, sure_fr). Force FR + signature LesArmeniens.com + normalisation titre."""
+    """Retourne (title_fr, body_fr, sure_fr).
+       Force FR + signature LesArmeniens.com + normalisation titre + >=120 mots + recalcul titre si peu pertinent."""
     if not raw_text:
         return (normalize_title(title_src or "Actualité"), "", False)
 
@@ -279,10 +363,12 @@ def rewrite_article_fr(title_src: str, raw_text: str):
 
     def call_openai():
         prompt = (
-            "Tu es un journaliste francophone. "
-            "Traduis et réécris en FRANÇAIS le Titre et le Corps de l'article ci-dessous. "
-            "Style neutre, informatif. 150–220 mots pour le corps. "
-            "RENVOIE UNIQUEMENT du JSON avec les clés 'title' et 'body'. "
+            "Tu es un journaliste francophone.\n"
+            "Réécris en FRANÇAIS le TITRE et le CORPS de l'article ci-dessous, "
+            "sans inventer de faits, en conservant les informations factuelles (noms, lieux, chiffres, citations importantes).\n"
+            f"Longueur du corps : au moins {TARGET_MIN_WORDS} mots (idéalement <= {TARGET_MAX_WORDS}).\n"
+            "Style neutre, informatif, fluide, sans listes à puces ni intertitres HTML.\n"
+            "RENVOIE UNIQUEMENT du JSON avec les clés 'title' et 'body'.\n"
             "Le 'body' doit être du TEXTE BRUT (pas de balises) et DOIT se terminer par: - LesArmeniens.com.\n\n"
             f"Titre (source): {title_src}\n"
             f"Texte (source): {clean_input}"
@@ -309,10 +395,14 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             title_fr = strip_tags(parts[0]).strip()
             body_fr  = strip_tags(parts[1] if len(parts) > 1 else "").strip()
         if not body_fr:
-            body_fr = " ".join(clean_input.split()[:220]).strip()
-        body_fr = ensure_signature(body_fr)
+            body_fr = " ".join(clean_input.split()).strip()
+        # garanties
+        body_fr = ensure_min_words(body_fr, clean_input, TARGET_MIN_WORDS)
         if not title_fr:
             title_fr = _title_from_text_fallback(body_fr)
+        # si le titre colle mal au contenu, on le régénère
+        if title_relevance_score(title_fr, body_fr) < 0.35 or len(_tokenize_words(title_fr)) < 4:
+            title_fr = derive_title_from_body(body_fr)
         title_fr = normalize_title(title_fr)
         return title_fr, body_fr
 
@@ -325,14 +415,22 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             if looks_french(b2) and looks_french(t2):
                 return (t2, b2, True)
             tfb = _title_from_text_fallback(b2)
-            return (normalize_title(tfb), ensure_signature(b2), False)
+            b2  = ensure_min_words(b2, clean_input, TARGET_MIN_WORDS)
+            if title_relevance_score(tfb, b2) < 0.35 or len(_tokenize_words(tfb)) < 4:
+                tfb = derive_title_from_body(b2)
+            return (normalize_title(tfb), b2, False)
         except Exception as e:
             print(f"[AI] rewrite_article_fr failed: {e}")
 
     # Fallback local
-    fr_body = " ".join(strip_tags(raw_text).split()[:220]).strip()
+    fr_body = " ".join(strip_tags(raw_text).split())
+    # borne haute de sécurité
+    if _word_count(fr_body) > TARGET_MAX_WORDS:
+        fr_body = " ".join(_tokenize_words(fr_body)[:TARGET_MAX_WORDS])
+    fr_body = ensure_min_words(fr_body, raw_text, TARGET_MIN_WORDS)
     fr_title = _title_from_text_fallback(fr_body)
-    fr_body  = ensure_signature(fr_body)
+    if title_relevance_score(fr_title, fr_body) < 0.35 or len(_tokenize_words(fr_title)) < 4:
+        fr_title = derive_title_from_body(fr_body)
     return (normalize_title(fr_title), fr_body, False)
 
 # ================== HTTP & IMAGES ==================
@@ -487,15 +585,14 @@ def already_have_link(link: str) -> bool:
         con.close()
 
 def insert_post(title_fr, body_text, link, source, img_url):
-    # Image obligatoire (aucun fallback accepté si REQUIRE_IMAGE=True)
+    # Image obligatoire
     if REQUIRE_IMAGE and not img_url:
         return False
-
     local_path, sha1 = download_image(img_url) if img_url else (None, None)
     if REQUIRE_IMAGE and (not local_path or not sha1):
         return False
 
-    # anti-doublon sur image
+    # anti-doublon image
     if sha1:
         con = db()
         try:
@@ -554,7 +651,7 @@ def scrape_rss_once(feeds):
                     if not article_text or len(article_text) < 120:
                         skipped += 1; continue
 
-                    # image (photo obligatoire : aucune image → on saute)
+                    # image (photo obligatoire)
                     img_url = get_image_from_entry(e, page_html=page_html, page_url=link)
                     if REQUIRE_IMAGE and not img_url:
                         skipped += 1
@@ -897,81 +994,4 @@ def import_now():
         flash(f"Erreur d’import (sites) : Config sites JSON invalide: {e}")
         return redirect(url_for("admin"))
 
-    def worker(feeds, scrapers):
-        try:
-            c1, s1 = scrape_rss_once(feeds)
-            c2, s2 = scrape_index_once(scrapers)
-            set_setting("last_import_result", f"OK : {c1+c2} nouveaux, {s1+s2} ignorés.")
-        except Exception as e:
-            msg = f"Erreur : {e}\n{traceback.format_exc()}"
-            print("[IMPORT WORKER] fatal:", msg)
-            set_setting("last_import_result", msg)
-
-    threading.Thread(target=worker, args=(feed_list, scrapers_cfg), daemon=True).start()
-    flash("Import lancé en arrière-plan. Recharge l’admin dans ~1 minute pour voir le résultat.")
-    return redirect(url_for("admin"))
-
-@app.get("/import-now")
-def import_now_get():
-    flash("Utilise le bouton « Importer maintenant » dans l’admin.")
-    return redirect(url_for("admin"))
-
-@app.post("/save/<int:post_id>")
-def save(post_id):
-    if not session.get("ok"): return redirect(url_for("admin"))
-    action     = request.form.get("action","save")
-    title      = strip_tags(request.form.get("title","").strip())
-    body       = strip_tags(request.form.get("body","").strip())
-    publish_at = request.form.get("publish_at","").strip()
-
-    if body:
-        body = ensure_signature(body)
-
-    con = db()
-    try:
-        con.execute("UPDATE posts SET title=?, body=?, updated_at=? WHERE id=?",
-                    (title, body, datetime.now(timezone.utc).isoformat(timespec="minutes"), post_id))
-        if action == "publish":
-            row = con.execute("SELECT image_url FROM posts WHERE id=?", (post_id,)).fetchone()
-            if REQUIRE_IMAGE and (not row or not row["image_url"]):
-                flash("Publication refusée : une image est obligatoire.")
-            else:
-                con.execute("UPDATE posts SET status='published', publish_at=NULL WHERE id=?", (post_id,))
-                flash("Publié immédiatement.")
-        elif action == "unpublish":
-            con.execute("UPDATE posts SET status='draft', publish_at=NULL WHERE id=?", (post_id,))
-            flash("Dépublié.")
-        elif action == "schedule":
-            if not publish_at:
-                flash("Choisis une date/heure (UTC) pour planifier.")
-            else:
-                iso_utc = publish_at if len(publish_at) == 16 else publish_at[:16]
-                iso_utc += ":00+00:00" if len(iso_utc) == 16 else ""
-                con.execute("UPDATE posts SET status='scheduled', publish_at=? WHERE id=?", (iso_utc, post_id))
-                flash(f"Planifié pour {iso_utc} (UTC).")
-        elif action == "delete":
-            con.execute("DELETE FROM posts WHERE id=?", (post_id,))
-            flash("Supprimé.")
-        else:
-            flash("Enregistré.")
-        con.commit()
-    finally:
-        con.close()
-    return redirect(url_for("admin"))
-
-@app.get("/logout")
-def logout():
-    session.clear(); return redirect(url_for("home"))
-
-@app.get("/console")
-def alias_console():
-    return redirect(url_for("admin"))
-
-# --------- boot ---------
-init_db()
-bootstrap_openai_key()  # Clé OpenAI bootstrapée une fois depuis l'ENV vers la DB
-threading.Thread(target=publish_due_loop, daemon=True).start()
-threading.Thread(target=import_loop, daemon=True).start()
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    def worker(feeds, scr
