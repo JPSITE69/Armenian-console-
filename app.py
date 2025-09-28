@@ -1,6 +1,6 @@
 # app.py — Console Arménienne
 # Auto-import (RSS + scrapers) • Auto-publication • Photo obligatoire (fallback + conversion JPEG)
-# Réécriture FR (120–800 mots) • Titre = TRADUCTION SIMPLE DU TITRE ORIGINAL
+# Réécriture FR (120–800 mots) • Titre = traduction FR du titre original (forcée)
 # Nettoyage source & corps • Signature: - LesArmeniens.com • Clé OpenAI saisie une fois (ENV → DB)
 
 from flask import Flask, request, redirect, url_for, Response, render_template_string, session, flash
@@ -289,12 +289,8 @@ def clean_source_html(html: str) -> str:
     """Supprime blocs parasites avant extraction: partages, related, tags, nav, footer, scripts…"""
     try:
         soup = BeautifulSoup(html or "", "html.parser")
-
-        # bannière / aside / nav / footer / scripts / styles
         for tag in soup.find_all(["aside","nav","footer","form","script","style"]):
             tag.decompose()
-
-        # classes/id parasites courants
         junk_selectors = [
             "[class*='share']", "[class*='sharing']", "[class*='social']",
             "[class*='tags']", "[class*='related']", "[class*='recommend']",
@@ -306,11 +302,8 @@ def clean_source_html(html: str) -> str:
         for sel in junk_selectors:
             for n in soup.select(sel):
                 n.decompose()
-
-        # légendes trop verbeuses
         for figcap in soup.find_all("figcaption"):
             figcap.decompose()
-
         return str(soup)
     except Exception:
         return html or ""
@@ -337,13 +330,10 @@ def clean_body_text(body: str) -> str:
     had_sig = b.endswith(sig)
     if had_sig:
         b = b[: -len(sig)].rstrip()
-
     lines = [ln for ln in b.splitlines() if not CLEAN_LINES_PAT.match(ln or "")]
     b = "\n".join(lines)
-
     b = re.sub(r"[ \t]+", " ", b)
     b = re.sub(r"\n{3,}", "\n\n", b).strip()
-
     uniq = []
     for para in b.split("\n\n"):
         p = para.strip()
@@ -391,69 +381,102 @@ def ensure_min_words(body_text: str, source_text: str, min_words: int = TARGET_M
 
     return ensure_signature(body)
 
-# ================== TITRE — Traduction simple du titre original ==================
-def translate_title_fr(title_src: str) -> str:
-    """
-    Traduit simplement le titre original en FR (6–14 mots, sans nom de média, ni 'published', ni URL),
-    puis normalise. Fallback: normalisation du titre source.
-    """
-    raw = (title_src or "").strip()
-    if not raw:
-        return "Actualité"
+# ================== TITRE/CORPS — FORCER LE FRANÇAIS ==================
+def enforce_french_title(text: str, title_src: str) -> str:
+    """Si le titre n'est pas clairement FR, traduis-le en FR (secours IA), sinon normalise."""
+    t = (text or "").strip()
+    if looks_french(t):
+        return normalize_title(t)
 
     key, model = active_openai()
     if not key:
-        return normalize_title(raw)
+        return normalize_title(t or title_src or "Actualité")
 
     prompt = (
-        "Traduis en FRANÇAIS ce TITRE d'article, sans inventer ni résumer :\n"
-        "- 6 à 14 mots, neutre et informatif\n"
-        "- Interdictions absolues : nom de média, URL, mots 'published/publié', signature, émojis\n"
-        "- Pas de point final\n\n"
-        f"Titre source : {raw}"
+        "Traduis en FRANÇAIS ce TITRE d'article, fidèle et naturel. "
+        "Contraintes: 6–14 mots, pas de nom de média, pas d'URL, pas de «published/publié», pas d'émojis, pas de point final.\n\n"
+        f"Titre source: {strip_tags(title_src or t)}"
     )
     try:
         r = requests.post("https://api.openai.com/v1/chat/completions",
                           headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                          json={
-                              "model": model or "gpt-4o-mini",
-                              "temperature": 0.2,
-                              "messages": [{"role":"user","content":prompt}]
-                          },
+                          json={"model": model or "gpt-4o-mini", "temperature": 0.1,
+                                "messages":[{"role":"user","content":prompt}]},
                           timeout=30)
         j = r.json()
-        out = (j.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
-        return normalize_title(out or raw)
+        out = (j.get("choices") or [{}])[0].get("message", {}).get("content","").strip()
+        return normalize_title(strip_tags(out) or (title_src or t))
     except Exception as e:
-        print("[AI] translate_title_fr failed:", e)
-        return normalize_title(raw)
+        print("[AI] enforce_french_title fail:", e)
+        return normalize_title(t or title_src or "Actualité")
 
-# ================== RÉÉCRITURE ==================
+def enforce_french_body(text: str, source_text: str) -> str:
+    """
+    Si le corps n'est pas clairement FR, on le retraduit en FR (secours IA),
+    puis on garantit longueur min/max + nettoyage + signature.
+    """
+    b = (text or "").strip()
+    if looks_french(b) and _word_count(b) >= TARGET_MIN_WORDS:
+        return clean_body_text(ensure_signature(b))
+
+    key, model = active_openai()
+    if key:
+        prompt = (
+            "Traduis fidèlement en FRANÇAIS le texte d'article ci-dessous, style neutre et informatif.\n"
+            f"Longueur visée: {TARGET_MIN_WORDS}–{TARGET_MAX_WORDS} mots (±10%). "
+            "Pas de listes à puces, pas de balises HTML, pas d'émojis. "
+            "Termine par: - LesArmeniens.com\n\n"
+            f"TEXTE:\n{strip_tags(source_text or b)}"
+        )
+        try:
+            r = requests.post("https://api.openai.com/v1/chat/completions",
+                              headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                              json={"model": model or "gpt-4o-mini", "temperature": 0.2,
+                                    "messages":[{"role":"user","content":prompt}]},
+                              timeout=60)
+            j = r.json()
+            out = (j.get("choices") or [{}])[0].get("message", {}).get("content","").strip()
+            b = strip_tags(out or b)
+        except Exception as e:
+            print("[AI] enforce_french_body fail:", e)
+
+    b = ensure_min_words(b, source_text or b, TARGET_MIN_WORDS)
+    b = clean_body_text(b)
+    return b
+
+# ================== RÉÉCRITURE (titre + corps en FR, avec double vérif) ==================
 def rewrite_article_fr(title_src: str, raw_text: str):
-    """Retourne (title_fr, body_fr, sure_fr).
-       FR + signature LesArmeniens.com + 120–800 mots + Titre = traduction simple du titre source + nettoyage."""
+    """
+    Retourne (title_fr, body_fr, sure_fr).
+    - Titre: TRADUCTION FR du titre source (6–14 mots), forcée; sinon dérivé du corps FR
+    - Corps: réécriture/traduction FR 120–800 mots, neutre, informative
+    - Nettoyage + signature: - LesArmeniens.com
+    """
     if not raw_text:
         return (normalize_title(title_src or "Actualité"), "", False)
 
     key, model = active_openai()
     clean_input = strip_tags(raw_text)
+    title_src_clean = strip_tags(title_src or "").strip()
 
-    def call_openai():
+    def call_openai_both():
+        """Demande Titre (traduction FR) + Corps (réécriture FR) en un seul JSON."""
         prompt = (
             "Tu es un journaliste francophone.\n"
-            "Réécris en FRANÇAIS le CORPS de l'article ci-dessous, "
-            "sans inventer de faits, en conservant les informations factuelles (noms, lieux, chiffres, citations importantes).\n"
-            f"Longueur du corps : entre {TARGET_MIN_WORDS} et {TARGET_MAX_WORDS} mots (pas moins, pas plus que ±10%).\n"
-            "Style neutre, informatif, fluide, sans listes à puces ni intertitres HTML.\n"
-            "RENVOIE UNIQUEMENT du JSON avec les clés 'body'.\n"
+            "1) TRADUIS en FRANÇAIS le TITRE SOURCE, naturel et fidèle (6–14 mots). "
+            "   Interdictions: nom de média, URL, «published/publié», signature, émojis. Pas de point final.\n"
+            "2) RÉÉCRIS en FRANÇAIS le CORPS sans inventer, en conservant les infos factuelles.\n"
+            f"   Longueur: {TARGET_MIN_WORDS}–{TARGET_MAX_WORDS} mots (±10%). Style neutre, informatif. Pas de listes à puces.\n"
+            "Réponds STRICTEMENT en JSON: {\"title\": \"...\", \"body\": \"...\"}\n"
             "Le 'body' doit être du TEXTE BRUT (pas de balises) et DOIT se terminer par: - LesArmeniens.com.\n\n"
-            f"Texte (source): {clean_input}"
+            f"TITRE SOURCE: {title_src_clean}\n"
+            f"TEXTE SOURCE: {clean_input}"
         )
         payload = {
             "model": model or "gpt-4o-mini",
             "temperature": 0.2,
             "messages": [
-                {"role": "system", "content": "Tu écris en français clair et concis. Réponds uniquement au format demandé."},
+                {"role": "system", "content": "Tu écris en français clair et exact. Réponds uniquement en JSON."},
                 {"role": "user", "content": prompt}
             ]
         }
@@ -464,45 +487,40 @@ def rewrite_article_fr(title_src: str, raw_text: str):
         out = (j.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
         try:
             data = _json.loads(out)
+            title_fr = strip_tags(data.get("title","")).strip()
             body_fr  = strip_tags(data.get("body","")).strip()
         except Exception:
-            body_fr  = strip_tags(out).strip()
-
-        if not body_fr:
-            body_fr = " ".join(clean_input.split()).strip()
-
-        # Garanties longueur + signature + nettoyage
-        body_fr = ensure_min_words(body_fr, clean_input, TARGET_MIN_WORDS)
-        body_fr = clean_body_text(body_fr)
-
-        # Titre = traduction simple du titre original
-        title_fr = translate_title_fr(title_src)
+            parts = out.split("\n", 1)
+            title_fr = strip_tags(parts[0]).strip()
+            body_fr  = strip_tags(parts[1] if len(parts) > 1 else "").strip()
         return title_fr, body_fr
 
     if key:
         try:
-            t1, b1 = call_openai()
-            if looks_french(b1) and looks_french(t1):
-                return (t1, b1, True)
-            # second essai
-            t2, b2 = call_openai()
-            if looks_french(b2) and looks_french(t2):
-                return (t2, b2, True)
-            # fallback mélange
-            t_fallback = translate_title_fr(title_src)
-            b2  = ensure_min_words(b2, clean_input, TARGET_MIN_WORDS)
-            b2  = clean_body_text(b2)
-            return (t_fallback, b2, False)
+            title_fr, body_fr = call_openai_both()
+
+            # Force FR sur le corps (si besoin), longueur/clean/signature
+            body_fr = enforce_french_body(body_fr, clean_input)
+
+            # Titre: force FR (traduction stricte du titre source), sinon dérive depuis le corps FR
+            title_fr = enforce_french_title(title_fr, title_src_clean)
+            if not looks_french(title_fr):
+                title_fr = _title_from_text_fallback(body_fr)
+
+            title_fr = normalize_title(title_fr)
+            return (title_fr, body_fr, True)
+
         except Exception as e:
             print(f"[AI] rewrite_article_fr failed: {e}")
 
-    # Fallback local (sans OpenAI pour le corps) : on coupe/complète proprement
+    # Fallback local (pas d'IA)
     fr_body = " ".join(strip_tags(raw_text).split())
     if _word_count(fr_body) > TARGET_MAX_WORDS:
         fr_body = " ".join(_tokenize_words(fr_body)[:TARGET_MAX_WORDS])
     fr_body = ensure_min_words(fr_body, raw_text, TARGET_MIN_WORDS)
     fr_body = clean_body_text(fr_body)
-    fr_title = translate_title_fr(title_src)  # traduire quand même si possible (utilise ENV/DB si dispo)
+    fr_title = _title_from_text_fallback(fr_body)
+    fr_title = normalize_title(fr_title)
     return (fr_title, fr_body, False)
 
 # ================== HTTP & IMAGES ==================
@@ -603,24 +621,20 @@ def download_image(url):
         r = requests.get(url, timeout=20)
         r.raise_for_status()
         data = r.content
-
         try:
             im = Image.open(io.BytesIO(data))
             im.load()
             if im.mode not in ("RGB", "L"):
                 im = im.convert("RGB")
-
             os.makedirs("static/images", exist_ok=True)
             sha1 = hashlib.sha1(data).hexdigest()
             path = f"static/images/{sha1}.jpg"
             if not os.path.exists(path):
                 im.save(path, format="JPEG", quality=88, optimize=True)
-
             return "/" + path, sha1
         except Exception as e:
             print(f"[IMG] convert/save fail {url}: {e}")
             return None, None
-
     except Exception as e:
         print(f"[IMG] download failed for {url}: {e}")
         return None, None
@@ -686,10 +700,9 @@ def insert_post(title_fr, body_text, link, source, img_url):
     if sha1:
         con = db()
         try:
-            if con.execute("SELECT 1 FROM posts WHERE image_sha1=?", (sha1)).fetchone():
+            if con.execute("SELECT 1 FROM posts WHERE image_sha1=?", (sha1,)).fetchone():
                 return False
         except Exception:
-            # sqlite param fix
             pass
         finally:
             try: con.close()
@@ -1144,14 +1157,12 @@ def save(post_id):
     publish_at = request.form.get("publish_at","").strip()
 
     if body:
-        # garantit [TARGET_MIN_WORDS, TARGET_MAX_WORDS] + signature + nettoyage
         body = " ".join(_tokenize_words(body))
         if _word_count(body) > TARGET_MAX_WORDS:
             body = " ".join(_tokenize_words(body)[:TARGET_MAX_WORDS])
         body = ensure_min_words(body, body, TARGET_MIN_WORDS)
         body = clean_body_text(body)
 
-    # Si l'admin modifie le titre manuellement, on normalise simplement
     title = normalize_title(title)
 
     con = db()
@@ -1197,7 +1208,7 @@ def alias_console():
 # --------- boot ---------
 init_db()
 bootstrap_openai_key()
-# Import immédiat au démarrage (utile si l'hébergeur coupe les threads)
+# Import immédiat au démarrage
 try:
     run_import_once()
 except Exception as e:
