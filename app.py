@@ -1,6 +1,6 @@
 # app.py — Console Arménienne
 # Auto-import (RSS + scrapers) • Auto-publication • Photo obligatoire (fallback + conversion JPEG)
-# Réécriture FR (120–800 mots) • Titre = traduction FR du titre original (forcée)
+# Réécriture FR (120–800 mots) • Titre FR propre (anti-chiffres) ou traduction stricte du titre source
 # Nettoyage source & corps • Signature: - LesArmeniens.com • Clé OpenAI saisie une fois (ENV → DB)
 
 from flask import Flask, request, redirect, url_for, Response, render_template_string, session, flash
@@ -247,6 +247,38 @@ def _sentence_case(fr: str) -> str:
         fr = fr[0].upper() + fr[1:]
     return fr
 
+# --------- TITRES: anti-chiffres & parasites ----------
+BANNED_TITLE_WORDS = {
+    "lesarmeniens", "lesarmeniens.com", "armenien", "armeniens", "com",
+    "published", "publié", "publication", "rss", "feed",
+    "facebook", "instagram", "twitter", "x", "tiktok", "youtube", "whatsapp"
+}
+
+def _alpha_ratio(s: str) -> float:
+    if not s: return 0.0
+    letters = sum(1 for ch in s if ch.isalpha())
+    return letters / max(1, len(s))
+
+def _digit_ratio(s: str) -> float:
+    if not s: return 0.0
+    digits = sum(1 for ch in s if ch.isdigit())
+    return digits / max(1, len(s))
+
+def _strip_numeric_noise(text: str) -> str:
+    """Enlève tokens dominés par des chiffres (ex: '29-30-', '155-1-2', '2024')."""
+    toks = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9'’\-]+", text or "")
+    kept = []
+    for w in toks:
+        wl = w.strip("-_—–:;,.")
+        if not wl or wl.lower() in BANNED_TITLE_WORDS: 
+            continue
+        if wl.isdigit():
+            continue
+        if _digit_ratio(wl) >= 0.35:
+            continue
+        kept.append(wl)
+    return " ".join(kept)
+
 def normalize_title(src: str) -> str:
     if not src:
         return "Actualité"
@@ -256,11 +288,17 @@ def normalize_title(src: str) -> str:
     t = re.sub(r"(?i)\blesarmeniens\s*\.?\s*com\b", "", t)
     t = re.sub(r"(?i)\b(published|publié|publication|rss|feed)\b", "", t)
     t = re.sub(r"\bhttps?://\S+\b", "", t)
-    # nettoyages généraux
+    # anti-chiffres & nettoyage
+    t = _strip_numeric_noise(t)
     t = _clean_punct(t)
     t = re.sub(r"[^\w\sÀ-ÖØ-öø-ÿ’'\"!?.,:;()-–—]", " ", t)
     t = re.sub(r"\s{2,}", " ", t).strip()
     t = _sentence_case(t)
+
+    # Si trop de chiffres / trop pauvre → neutre (sera refait depuis le corps si besoin)
+    if _alpha_ratio(t) < 0.55 or _digit_ratio(t) > 0.25 or len(t.split()) < 5:
+        return "Actualité"
+
     if len(t) > TITLE_MAX:
         t = _smart_truncate(t, TITLE_MAX)
     t = t.rstrip()
@@ -412,21 +450,25 @@ def enforce_french_title(text: str, title_src: str) -> str:
 
 def enforce_french_body(text: str, source_text: str) -> str:
     """
-    Si le corps n'est pas clairement FR, on le retraduit en FR (secours IA),
-    puis on garantit longueur min/max + nettoyage + signature.
+    Garantit un corps FR NON VIDE :
+    - si texte FR et longueur OK → nettoyage + signature
+    - sinon → traduction/recopie de la source, complétion à TARGET_MIN_WORDS, nettoyage, signature
     """
-    b = (text or "").strip()
+    src = strip_tags(source_text or "")
+    b = strip_tags(text or "").strip()
+
     if looks_french(b) and _word_count(b) >= TARGET_MIN_WORDS:
         return clean_body_text(ensure_signature(b))
 
+    # Secours IA si dispo
     key, model = active_openai()
     if key:
         prompt = (
             "Traduis fidèlement en FRANÇAIS le texte d'article ci-dessous, style neutre et informatif.\n"
             f"Longueur visée: {TARGET_MIN_WORDS}–{TARGET_MAX_WORDS} mots (±10%). "
-            "Pas de listes à puces, pas de balises HTML, pas d'émojis. "
+            "Pas de listes à puces, pas de HTML, pas d'émojis. "
             "Termine par: - LesArmeniens.com\n\n"
-            f"TEXTE:\n{strip_tags(source_text or b)}"
+            f"TEXTE:\n{src or b}"
         )
         try:
             r = requests.post("https://api.openai.com/v1/chat/completions",
@@ -436,11 +478,13 @@ def enforce_french_body(text: str, source_text: str) -> str:
                               timeout=60)
             j = r.json()
             out = (j.get("choices") or [{}])[0].get("message", {}).get("content","").strip()
-            b = strip_tags(out or b)
+            b = strip_tags(out or b or src)
         except Exception as e:
             print("[AI] enforce_french_body fail:", e)
 
-    b = ensure_min_words(b, source_text or b, TARGET_MIN_WORDS)
+    if not b:
+        b = src
+    b = ensure_min_words(b, src or b, TARGET_MIN_WORDS)
     b = clean_body_text(b)
     return b
 
@@ -448,8 +492,8 @@ def enforce_french_body(text: str, source_text: str) -> str:
 def rewrite_article_fr(title_src: str, raw_text: str):
     """
     Retourne (title_fr, body_fr, sure_fr).
-    - Titre: TRADUCTION FR du titre source (6–14 mots), forcée; sinon dérivé du corps FR
-    - Corps: réécriture/traduction FR 120–800 mots, neutre, informative
+    - Titre: traduction FR stricte (6–14 mots) ou fallback propre ; anti-chiffres
+    - Corps: réécriture/traduction FR 120–800 mots, neutre, informative (jamais vide)
     - Nettoyage + signature: - LesArmeniens.com
     """
     if not raw_text:
@@ -499,15 +543,16 @@ def rewrite_article_fr(title_src: str, raw_text: str):
         try:
             title_fr, body_fr = call_openai_both()
 
-            # Force FR sur le corps (si besoin), longueur/clean/signature
+            # -------- GARDE-FOUS FINAUX --------
+            # Corps FR garanti (jamais vide)
             body_fr = enforce_french_body(body_fr, clean_input)
 
-            # Titre: force FR (traduction stricte du titre source), sinon dérive depuis le corps FR
+            # Titre FR normalisé ; s'il reste pauvre/numérique → refait depuis le corps FR
             title_fr = enforce_french_title(title_fr, title_src_clean)
-            if not looks_french(title_fr):
-                title_fr = _title_from_text_fallback(body_fr)
-
             title_fr = normalize_title(title_fr)
+            if title_fr == "Actualité" or _alpha_ratio(title_fr) < 0.55 or _digit_ratio(title_fr) > 0.25:
+                title_fr = normalize_title(_title_from_text_fallback(body_fr))
+
             return (title_fr, body_fr, True)
 
         except Exception as e:
@@ -519,8 +564,7 @@ def rewrite_article_fr(title_src: str, raw_text: str):
         fr_body = " ".join(_tokenize_words(fr_body)[:TARGET_MAX_WORDS])
     fr_body = ensure_min_words(fr_body, raw_text, TARGET_MIN_WORDS)
     fr_body = clean_body_text(fr_body)
-    fr_title = _title_from_text_fallback(fr_body)
-    fr_title = normalize_title(fr_title)
+    fr_title = normalize_title(_title_from_text_fallback(fr_body))
     return (fr_title, fr_body, False)
 
 # ================== HTTP & IMAGES ==================
@@ -828,7 +872,7 @@ def scrape_index_once(scrapers_json):
                     page = clean_source_html(page)
                     psoup = BeautifulSoup(page, "html.parser")
 
-                    # titre source (pour traduction simple)
+                    # titre source (pour traduction)
                     title_sel = cfg.get("title_selector","h1")
                     title_src = soup_select_attr(psoup, title_sel) or "(Sans titre)"
 
