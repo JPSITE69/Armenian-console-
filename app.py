@@ -1,7 +1,7 @@
 # app.py
 from flask import Flask, request, redirect, url_for, Response, render_template_string, session, flash
 import sqlite3, os, hashlib, io, traceback, re, threading, time, json as _json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
@@ -13,6 +13,11 @@ APP_NAME   = "Console Arménienne"
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "armenie")
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me")
 DB_PATH    = "site.db"
+
+# ---- Nouveaux réglages automatiques ----
+AUTO_PUBLISH = True  # publie automatiquement tout nouvel article
+REQUIRE_IMAGE = True # image obligatoire (sinon l'article est ignoré)
+IMPORT_INTERVAL_MIN = int(os.environ.get("IMPORT_INTERVAL_MIN", "15")) # import automatique toutes les N minutes
 
 # ---- RSS par défaut
 DEFAULT_FEEDS = [
@@ -435,22 +440,33 @@ def already_have_link(link: str) -> bool:
         con.close()
 
 def insert_post(title_fr, body_text, link, source, img_url):
+    # Image obligatoire (aucun fallback accepté si REQUIRE_IMAGE=True)
+    if REQUIRE_IMAGE and not img_url:
+        return False
+
     local_path, sha1 = download_image(img_url) if img_url else (None, None)
+    if REQUIRE_IMAGE and (not local_path or not sha1):
+        # pas d'image valide ⇒ on ignore
+        return False
+
+    # anti-doublon sur image (facultatif mais utile)
     if sha1:
-        # pas de doublon image
         con = db()
         try:
             if con.execute("SELECT 1 FROM posts WHERE image_sha1=?", (sha1,)).fetchone():
                 return False
         finally:
             con.close()
+
     now = datetime.now(timezone.utc).isoformat()
+    status = "published" if AUTO_PUBLISH else "draft"
+
     con = db()
     try:
         con.execute("""INSERT INTO posts
           (title, body, status, created_at, updated_at, publish_at, image_url, image_sha1, orig_link, source)
           VALUES(?,?,?,?,?,?,?,?,?,?)""",
-          (title_fr, body_text, "draft", now, now, None, local_path, sha1, link, source))
+          (title_fr, body_text, status, now, now, None, local_path, sha1, link, source))
         con.commit()
         return True
     except Exception as e:
@@ -492,8 +508,11 @@ def scrape_rss_once(feeds, default_image_url=None):
                     if not article_text or len(article_text) < 120:
                         skipped += 1; continue
 
-                    # image
-                    img_url = get_image_from_entry(e, page_html=page_html, page_url=link) or default_image_url
+                    # image (photo obligatoire : aucune image → on saute)
+                    img_url = get_image_from_entry(e, page_html=page_html, page_url=link)
+                    if REQUIRE_IMAGE and not img_url:
+                        skipped += 1
+                        continue
 
                     # FR
                     title_fr, body_text, _sure_fr = rewrite_article_fr(title_src, article_text)
@@ -562,7 +581,7 @@ def scrape_index_once(scrapers_json, default_image_url=None):
                     if not node_text or len(node_text) < 120:
                         skipped += 1; continue
 
-                    # image
+                    # image (photo obligatoire)
                     img = None
                     for isel in cfg.get("image_selectors", []):
                         val = soup_select_attr(psoup, isel)
@@ -571,8 +590,9 @@ def scrape_index_once(scrapers_json, default_image_url=None):
                             break
                     if not img:
                         img = find_main_image_in_html(page, base_url=link)
-                    if not img:
-                        img = default_image_url
+                    if REQUIRE_IMAGE and not img:
+                        skipped += 1
+                        continue
 
                     # FR
                     title_fr, body_text, _sure = rewrite_article_fr(title_src, node_text)
@@ -613,6 +633,38 @@ def publish_due_loop():
         except Exception as e:
             print("[SCHED] loop error:", e)
         time.sleep(30)
+
+# ======== NOUVEAU : boucle d'import automatique (RSS + scrapers) ========
+def import_loop():
+    while True:
+        try:
+            print("[IMPORT LOOP] démarrage cycle...")
+            default_image = get_setting("default_image_url","").strip() or None
+
+            # RSS
+            feeds_txt = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
+            feed_list = [u.strip() for u in feeds_txt.splitlines() if u.strip()]
+
+            # Scrapers
+            try:
+                scrapers_cfg = _json.loads(get_setting("scrapers_json", _json.dumps(DEFAULT_SCRAPERS)))
+                if not isinstance(scrapers_cfg, list):
+                    raise ValueError("Le JSON de scrapers doit être une liste []")
+            except Exception as e:
+                print(f"[IMPORT LOOP] Config sites JSON invalide: {e}")
+                scrapers_cfg = []
+
+            c1, s1 = scrape_rss_once(feed_list, default_image_url=default_image)
+            c2, s2 = scrape_index_once(scrapers_cfg, default_image_url=default_image)
+            set_setting("last_import_result", f"OK (auto): {c1+c2} nouveaux, {s1+s2} ignorés.")
+            print(f"[IMPORT LOOP] terminé: {c1+c2} nouveaux, {s1+s2} ignorés.")
+        except Exception as e:
+            msg = f"Erreur (auto import): {e}\n{traceback.format_exc()}"
+            print("[IMPORT LOOP] fatal:", msg)
+            set_setting("last_import_result", msg)
+
+        # pause
+        time.sleep(max(60, IMPORT_INTERVAL_MIN * 60))
 
 # ================== UI ==================
 LAYOUT = """
@@ -710,7 +762,7 @@ def admin():
         con.close()
 
     def card(r, published=False):
-        img = f"<img src='{r['image_url']}' style='max-width:200px'>" if r["image_url"] else ""
+        img = f"<img src='{r['image_url']}' style='max-width:200px'>" if r["image_url"] else "<small style='color:#900'>⚠️ Pas d'image</small>"
         pub_at = (r['publish_at'] or '')[:16]
         state_btns = ("<button name='action' value='unpublish' class='secondary'>⏸️ Dépublier</button>"
                       if published else
@@ -763,6 +815,7 @@ def admin():
       <form method="post" action="{url_for('import_now')}" style="margin-top:1rem">
         <button type="submit">🔁 Importer maintenant (RSS + Scraping)</button>
       </form>
+      <p><small>Import automatique toutes les {IMPORT_INTERVAL_MIN} min.</small></p>
     </article>
 
     <h4>Brouillons</h4>{''.join(card(r) for r in drafts) or "<p>Aucun brouillon.</p>"}
@@ -843,8 +896,13 @@ def save(post_id):
         con.execute("UPDATE posts SET title=?, body=?, updated_at=? WHERE id=?",
                     (title, body, datetime.now(timezone.utc).isoformat(timespec="minutes"), post_id))
         if action == "publish":
-            con.execute("UPDATE posts SET status='published', publish_at=NULL WHERE id=?", (post_id,))
-            flash("Publié immédiatement.")
+            # Vérifie qu'il y a bien une image avant de publier
+            row = con.execute("SELECT image_url FROM posts WHERE id=?", (post_id,)).fetchone()
+            if REQUIRE_IMAGE and (not row or not row["image_url"]):
+                flash("Publication refusée : une image est obligatoire.")
+            else:
+                con.execute("UPDATE posts SET status='published', publish_at=NULL WHERE id=?", (post_id,))
+                flash("Publié immédiatement.")
         elif action == "unpublish":
             con.execute("UPDATE posts SET status='draft', publish_at=NULL WHERE id=?", (post_id,))
             flash("Dépublié.")
@@ -877,6 +935,8 @@ def alias_console():
 # --------- boot ---------
 init_db()
 threading.Thread(target=publish_due_loop, daemon=True).start()
+# démarrage de l'import automatique
+threading.Thread(target=import_loop, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
