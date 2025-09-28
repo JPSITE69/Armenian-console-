@@ -1,8 +1,7 @@
 # app.py — Console Arménienne
 # Auto-import (RSS + scrapers) • Auto-publication • Photo obligatoire (fallback + conversion JPEG)
-# Réécriture FR (120–800 mots) • Titres régénérés à partir de TOUT le contenu (anti-chiffres/parasites + secours IA)
-# Nettoyage source & corps • Signature obligatoire : - LesArmeniens.com
-# Clé OpenAI saisie une fois (ENV → DB) • Cron HTTP de secours
+# Réécriture FR (120–800 mots) • Titre = TRADUCTION SIMPLE DU TITRE ORIGINAL
+# Nettoyage source & corps • Signature: - LesArmeniens.com • Clé OpenAI saisie une fois (ENV → DB)
 
 from flask import Flask, request, redirect, url_for, Response, render_template_string, session, flash
 import sqlite3, os, hashlib, io, traceback, re, threading, time, json as _json
@@ -23,7 +22,6 @@ DB_PATH    = "site.db"
 AUTO_PUBLISH = True                    # Publie immédiatement tout nouvel article
 REQUIRE_IMAGE = True                   # Photo obligatoire
 IMPORT_INTERVAL_MIN = int(os.environ.get("IMPORT_INTERVAL_MIN", "10"))  # boucle auto (minutes)
-MIN_SOURCE_CHARS = 40                  # longueur min (caractères) avant réécriture
 
 # Longueurs cibles (mots)
 TARGET_MIN_WORDS = int(os.environ.get("TARGET_MIN_WORDS", "120"))
@@ -183,7 +181,7 @@ def set_setting(key, value):
     finally:
         con.close()
 
-# --- Bootstrap / cache OpenAI (clé une fois) ---
+# --- Bootstrap / cache OpenAI (clé une seule fois) ---
 _OPENAI_CACHE = {"key": None, "model": None}
 
 def bootstrap_openai_key():
@@ -249,66 +247,16 @@ def _sentence_case(fr: str) -> str:
         fr = fr[0].upper() + fr[1:]
     return fr
 
-# ------- anti-titres numériques/parasites -------
-ALPHA_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ]")
-BANNED_TITLE_WORDS = {
-    "lesarmeniens", "armenien", "armeniens", "com", "published", "publie", "publication",
-    "http", "https", "www", "tweet", "instagram", "facebook", "snapback"
-}
-
-def is_alpha_word(w: str) -> bool:
-    return bool(ALPHA_RE.search(w or ""))
-
-def digit_ratio(s: str) -> float:
-    if not s: return 0.0
-    d = sum(ch.isdigit() for ch in s)
-    return d / max(1, len(s))
-
-def sanitize_tokens(tokens: list[str]) -> list[str]:
-    out = []
-    for w in (tokens or []):
-        if not w or len(w) < 2:
-            continue
-        if w in STOP_FR:
-            continue
-        wl = w.lower()
-        if wl in BANNED_TITLE_WORDS:
-            continue
-        if not is_alpha_word(wl):
-            continue
-        if wl.isdigit():
-            continue
-        if digit_ratio(wl) > 0.4:
-            continue
-        out.append(wl)
-    return out
-
-def is_bad_title(t: str, body: str) -> bool:
-    if not t:
-        return True
-    t_clean = re.sub(r"[^\w\sÀ-ÖØ-öø-ÿ’'-]", " ", t)
-    toks = [w for w in _tokenize_words(t_clean) if w not in STOP_FR]
-    alpha = [w for w in toks if is_alpha_word(w)]
-    if len(alpha) < 4:
-        return True
-    if digit_ratio(t_clean) > 0.25:
-        return True
-    if len(set(alpha)) <= 2:
-        return True
-    if re.search(r"(?i)\blesarmeniens\s*\.?\s*com\b", t_clean):
-        return True
-    if re.fullmatch(r"(?i)(?:published|publié|publication)", t_clean.strip()):
-        return True
-    return False
-
 def normalize_title(src: str) -> str:
     if not src:
         return "Actualité"
     t = src.strip()
+    # enlève suffixes de site + urls + mots parasites fréquents
     t = SITE_SUFFIX_PAT.sub("", t)
     t = re.sub(r"(?i)\blesarmeniens\s*\.?\s*com\b", "", t)
-    t = re.sub(r"(?i)\b(published|publié|publication)\b", "", t)
+    t = re.sub(r"(?i)\b(published|publié|publication|rss|feed)\b", "", t)
     t = re.sub(r"\bhttps?://\S+\b", "", t)
+    # nettoyages généraux
     t = _clean_punct(t)
     t = re.sub(r"[^\w\sÀ-ÖØ-öø-ÿ’'\"!?.,:;()-–—]", " ", t)
     t = re.sub(r"\s{2,}", " ", t).strip()
@@ -318,8 +266,6 @@ def normalize_title(src: str) -> str:
     t = t.rstrip()
     if t.endswith(("—", "–", "-", ":", ";", ",")):
         t = t[:-1].rstrip()
-    if is_bad_title(t, ""):
-        return "Actualité"
     return t or "Actualité"
 
 def _title_from_text_fallback(fr_text: str) -> str:
@@ -343,8 +289,12 @@ def clean_source_html(html: str) -> str:
     """Supprime blocs parasites avant extraction: partages, related, tags, nav, footer, scripts…"""
     try:
         soup = BeautifulSoup(html or "", "html.parser")
+
+        # bannière / aside / nav / footer / scripts / styles
         for tag in soup.find_all(["aside","nav","footer","form","script","style"]):
             tag.decompose()
+
+        # classes/id parasites courants
         junk_selectors = [
             "[class*='share']", "[class*='sharing']", "[class*='social']",
             "[class*='tags']", "[class*='related']", "[class*='recommend']",
@@ -356,8 +306,11 @@ def clean_source_html(html: str) -> str:
         for sel in junk_selectors:
             for n in soup.select(sel):
                 n.decompose()
+
+        # légendes trop verbeuses
         for figcap in soup.find_all("figcaption"):
             figcap.decompose()
+
         return str(soup)
     except Exception:
         return html or ""
@@ -384,10 +337,13 @@ def clean_body_text(body: str) -> str:
     had_sig = b.endswith(sig)
     if had_sig:
         b = b[: -len(sig)].rstrip()
+
     lines = [ln for ln in b.splitlines() if not CLEAN_LINES_PAT.match(ln or "")]
     b = "\n".join(lines)
+
     b = re.sub(r"[ \t]+", " ", b)
     b = re.sub(r"\n{3,}", "\n\n", b).strip()
+
     uniq = []
     for para in b.split("\n\n"):
         p = para.strip()
@@ -397,7 +353,7 @@ def clean_body_text(body: str) -> str:
     b = ensure_signature(b)
     return b
 
-# ------- Helpers longueur >= 120 et titre basé contenu -------
+# ------- Helpers longueur >= 120 -------
 STOP_FR = set("""
 le la les un une des du de au aux en sur pour par avec dans que qui ne pas est été
 sont était selon afin aussi plus leur lui ses ces cette ce cela donc ainsi tandis
@@ -416,143 +372,66 @@ def ensure_min_words(body_text: str, source_text: str, min_words: int = TARGET_M
     sig = "- LesArmeniens.com"
     if body.endswith(sig):
         body = body[:-len(sig)].rstrip()
+
     if _word_count(body) >= min_words:
         return ensure_signature(body)
+
     src_clean = strip_tags(source_text or "")
     extra = " ".join([w for w in src_clean.split() if w not in set(body.split())]) or src_clean
+
     body_words = _tokenize_words(body)
     extra_words = _tokenize_words(extra)
     need = max(0, min_words - len(body_words))
     if need > 0 and extra_words:
         take = min(len(extra_words), int(need * 1.3))
         body = (body + " " + " ".join(extra_words[:take])).strip()
+
     if _word_count(body) > TARGET_MAX_WORDS:
         body = " ".join(_tokenize_words(body)[:TARGET_MAX_WORDS])
+
     return ensure_signature(body)
 
-def title_relevance_score(title: str, body_text: str) -> float:
-    tw = [w for w in _tokenize_words(title) if w not in STOP_FR]
-    if not tw:
-        return 0.0
-    bw = set([w for w in _tokenize_words(body_text) if w not in STOP_FR])
-    hits = sum(1 for w in tw if w in bw)
-    return hits / max(1, len(tw))
-
-def derive_title_from_body(body_text: str, min_words: int = 6, max_words: int = 14) -> str:
-    """Titre à partir de tout le contenu (tokens filtrés + n-grammes), en bannissant chiffres/parasites."""
-    txt = strip_tags(body_text or "").strip()
-    if not txt:
+# ================== TITRE — Traduction simple du titre original ==================
+def translate_title_fr(title_src: str) -> str:
+    """
+    Traduit simplement le titre original en FR (6–14 mots, sans nom de média, ni 'published', ni URL),
+    puis normalise. Fallback: normalisation du titre source.
+    """
+    raw = (title_src or "").strip()
+    if not raw:
         return "Actualité"
-    raw_tokens = _tokenize_words(txt)
-    tokens = sanitize_tokens(raw_tokens)
-    if not tokens:
-        return normalize_title(_title_from_text_fallback(txt))
 
-    freq = {}
-    for w in tokens:
-        freq[w] = freq.get(w, 0) + 1
-    w_weight = {w: freq[w] * (1.0 + min(len(w), 14) / 6.0) for w in freq}
-
-    def ngrams(words, n):
-        return [" ".join(words[i:i+n]) for i in range(len(words)-n+1)]
-
-    def valid_ng(ng: str) -> bool:
-        parts = ng.split()
-        if sum(1 for p in parts if is_alpha_word(p)) < max(1, len(parts)//2):
-            return False
-        if digit_ratio(ng) > 0.25:
-            return False
-        return True
-
-    bigrams  = [g for g in ngrams(tokens, 2) if valid_ng(g)]
-    trigrams = [g for g in ngrams(tokens, 3) if valid_ng(g)]
-
-    def score_ngram(ng):
-        parts = ng.split()
-        uniq = set(parts)
-        base = sum(w_weight.get(p, 0.0) for p in parts)
-        rep_penalty = (len(parts) / len(uniq)) if len(uniq) else 2.0
-        return base / rep_penalty
-
-    cand_tri = {}
-    for g in trigrams:
-        cand_tri[g] = cand_tri.get(g, 0.0) + score_ngram(g)
-    cand_bi = {}
-    for g in bigrams:
-        cand_bi[g] = cand_bi.get(g, 0.0) + score_ngram(g)
-
-    top_tri = sorted(cand_tri.items(), key=lambda kv: kv[1], reverse=True)[:12]
-    top_bi  = sorted(cand_bi.items(),  key=lambda kv: kv[1], reverse=True)[:12]
-
-    chosen, used = [], set()
-    def push_phrase(phrase):
-        for w in phrase.split():
-            if w not in used:
-                chosen.append(w); used.add(w)
-
-    if top_tri:
-        push_phrase(top_tri[0][0])
-    elif top_bi:
-        push_phrase(top_bi[0][0])
-    else:
-        for w, _ in sorted(w_weight.items(), key=lambda kv: kv[1], reverse=True)[:max_words]:
-            push_phrase(w)
-
-    if len(chosen) < min_words and top_bi:
-        for phrase, _ in top_bi:
-            if len(chosen) >= max_words: break
-            if digit_ratio(phrase) > 0.25: continue
-            p_words = phrase.split()
-            overlap = sum(1 for w in p_words if w in used)
-            if overlap <= len(p_words) // 2:
-                push_phrase(phrase)
-
-    if len(chosen) < min_words:
-        for w, _ in sorted(w_weight.items(), key=lambda kv: kv[1], reverse=True):
-            if len(chosen) >= min(min_words, max_words): break
-            if w not in used: push_phrase(w)
-
-    headline = " ".join(chosen[:max_words])
-    headline = normalize_title(headline)
-    if is_bad_title(headline, body_text):
-        for phrase, _ in top_tri + top_bi:
-            cand = normalize_title(phrase)
-            if not is_bad_title(cand, body_text):
-                return cand
-        top_words = [w for w, _ in sorted(w_weight.items(), key=lambda kv: kv[1], reverse=True)[:12]]
-        cand = normalize_title(" ".join(top_words[:max_words]))
-        return cand if not is_bad_title(cand, body_text) else "Actualité"
-    return headline
-
-# ===== Secours IA pour le titre (optionnel mais utile) =====
-def ai_derive_title_from_body(body_text: str) -> str | None:
-    """Demande à l'IA un titre 6–12 mots, sans média/URL/parasites."""
     key, model = active_openai()
     if not key:
-        return None
+        return normalize_title(raw)
+
     prompt = (
-        "Donne UNIQUEMENT un titre journalistique en FRANÇAIS, 6–12 mots, "
-        "basé sur le texte ci-dessous. Interdictions absolues: nom de média, URL, "
-        "mots 'published/publié', signature, émojis. Pas de point final.\n\n"
-        f"Texte:\n{strip_tags(body_text)[:4000]}"
+        "Traduis en FRANÇAIS ce TITRE d'article, sans inventer ni résumer :\n"
+        "- 6 à 14 mots, neutre et informatif\n"
+        "- Interdictions absolues : nom de média, URL, mots 'published/publié', signature, émojis\n"
+        "- Pas de point final\n\n"
+        f"Titre source : {raw}"
     )
     try:
         r = requests.post("https://api.openai.com/v1/chat/completions",
                           headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                          json={"model": model or "gpt-4o-mini","temperature":0.2,
-                                "messages":[{"role":"user","content":prompt}]},
+                          json={
+                              "model": model or "gpt-4o-mini",
+                              "temperature": 0.2,
+                              "messages": [{"role":"user","content":prompt}]
+                          },
                           timeout=30)
         j = r.json()
         out = (j.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
-        return normalize_title(out)
+        return normalize_title(out or raw)
     except Exception as e:
-        print("[AI] ai_derive_title_from_body failed:", e)
-        return None
+        print("[AI] translate_title_fr failed:", e)
+        return normalize_title(raw)
 
 # ================== RÉÉCRITURE ==================
 def rewrite_article_fr(title_src: str, raw_text: str):
     """Retourne (title_fr, body_fr, sure_fr).
-       FR + signature LesArmeniens.com + normalisation titre + 120–800 mots + recalcul titre (contenu global) + nettoyage."""
+       FR + signature LesArmeniens.com + 120–800 mots + Titre = traduction simple du titre source + nettoyage."""
     if not raw_text:
         return (normalize_title(title_src or "Actualité"), "", False)
 
@@ -562,13 +441,12 @@ def rewrite_article_fr(title_src: str, raw_text: str):
     def call_openai():
         prompt = (
             "Tu es un journaliste francophone.\n"
-            "Réécris en FRANÇAIS le TITRE et le CORPS de l'article ci-dessous, "
+            "Réécris en FRANÇAIS le CORPS de l'article ci-dessous, "
             "sans inventer de faits, en conservant les informations factuelles (noms, lieux, chiffres, citations importantes).\n"
             f"Longueur du corps : entre {TARGET_MIN_WORDS} et {TARGET_MAX_WORDS} mots (pas moins, pas plus que ±10%).\n"
             "Style neutre, informatif, fluide, sans listes à puces ni intertitres HTML.\n"
-            "RENVOIE UNIQUEMENT du JSON avec les clés 'title' et 'body'.\n"
+            "RENVOIE UNIQUEMENT du JSON avec les clés 'body'.\n"
             "Le 'body' doit être du TEXTE BRUT (pas de balises) et DOIT se terminer par: - LesArmeniens.com.\n\n"
-            f"Titre (source): {title_src}\n"
             f"Texte (source): {clean_input}"
         )
         payload = {
@@ -586,12 +464,10 @@ def rewrite_article_fr(title_src: str, raw_text: str):
         out = (j.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
         try:
             data = _json.loads(out)
-            title_fr = strip_tags(data.get("title","")).strip()
             body_fr  = strip_tags(data.get("body","")).strip()
         except Exception:
-            parts = out.split("\n", 1)
-            title_fr = strip_tags(parts[0]).strip()
-            body_fr  = strip_tags(parts[1] if len(parts) > 1 else "").strip()
+            body_fr  = strip_tags(out).strip()
+
         if not body_fr:
             body_fr = " ".join(clean_input.split()).strip()
 
@@ -599,27 +475,8 @@ def rewrite_article_fr(title_src: str, raw_text: str):
         body_fr = ensure_min_words(body_fr, clean_input, TARGET_MIN_WORDS)
         body_fr = clean_body_text(body_fr)
 
-        # Titre : si manquant, court, parasite ou peu pertinent -> généré depuis le contenu global
-        needs_derive = (
-            not title_fr
-            or len(_tokenize_words(title_fr)) < 4
-            or title_relevance_score(title_fr, body_fr) < 0.30
-            or is_bad_title(title_fr, body_fr)
-        )
-        if needs_derive:
-            title_fr = derive_title_from_body(body_fr)
-
-        title_fr = normalize_title(title_fr)
-
-        # Sécurité finale: si encore mauvais → secours IA → sinon derive()
-        if is_bad_title(title_fr, body_fr):
-            t_ai = ai_derive_title_from_body(body_fr)
-            if t_ai and not is_bad_title(t_ai, body_fr):
-                title_fr = t_ai
-            else:
-                title_fr = derive_title_from_body(body_fr)
-
-        title_fr = normalize_title(title_fr)
+        # Titre = traduction simple du titre original
+        title_fr = translate_title_fr(title_src)
         return title_fr, body_fr
 
     if key:
@@ -627,29 +484,26 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             t1, b1 = call_openai()
             if looks_french(b1) and looks_french(t1):
                 return (t1, b1, True)
+            # second essai
             t2, b2 = call_openai()
             if looks_french(b2) and looks_french(t2):
                 return (t2, b2, True)
-            tfb = _title_from_text_fallback(b2)
+            # fallback mélange
+            t_fallback = translate_title_fr(title_src)
             b2  = ensure_min_words(b2, clean_input, TARGET_MIN_WORDS)
             b2  = clean_body_text(b2)
-            if title_relevance_score(tfb, b2) < 0.30 or len(_tokenize_words(tfb)) < 4 or is_bad_title(tfb, b2):
-                alt = derive_title_from_body(b2)
-                tfb = alt if not is_bad_title(alt, b2) else (ai_derive_title_from_body(b2) or "Actualité")
-            return (normalize_title(tfb), b2, False)
+            return (t_fallback, b2, False)
         except Exception as e:
             print(f"[AI] rewrite_article_fr failed: {e}")
 
-    # Fallback local (sans OpenAI)
+    # Fallback local (sans OpenAI pour le corps) : on coupe/complète proprement
     fr_body = " ".join(strip_tags(raw_text).split())
     if _word_count(fr_body) > TARGET_MAX_WORDS:
         fr_body = " ".join(_tokenize_words(fr_body)[:TARGET_MAX_WORDS])
     fr_body = ensure_min_words(fr_body, raw_text, TARGET_MIN_WORDS)
     fr_body = clean_body_text(fr_body)
-    fr_title = derive_title_from_body(fr_body)
-    if is_bad_title(fr_title, fr_body):
-        fr_title = _title_from_text_fallback(fr_body)
-    return (normalize_title(fr_title), fr_body, False)
+    fr_title = translate_title_fr(title_src)  # traduire quand même si possible (utilise ENV/DB si dispo)
+    return (fr_title, fr_body, False)
 
 # ================== HTTP & IMAGES ==================
 def http_get(url, timeout=20):
@@ -739,16 +593,6 @@ def get_image_from_entry(entry, page_html=None, page_url=None):
             if imgtag and imgtag.get("src"):
                 return urljoin(page_url or "", imgtag["src"])
     if page_html:
-        # 2bis) <link rel="image_src"> / srcset
-        s2 = BeautifulSoup(page_html, "html.parser")
-        link_img = s2.find("link", rel=lambda v: v and "image_src" in v)
-        if link_img and link_img.get("href"):
-            return urljoin(page_url or "", link_img["href"])
-        imgtag = s2.find("img", attrs={"srcset": True})
-        if imgtag:
-            srcset = imgtag.get("srcset","").split(",")[0].strip().split(" ")[0]
-            if srcset:
-                return urljoin(page_url or "", srcset)
         return find_main_image_in_html(page_html, base_url=page_url)
     return None
 
@@ -759,20 +603,24 @@ def download_image(url):
         r = requests.get(url, timeout=20)
         r.raise_for_status()
         data = r.content
+
         try:
             im = Image.open(io.BytesIO(data))
             im.load()
             if im.mode not in ("RGB", "L"):
                 im = im.convert("RGB")
+
             os.makedirs("static/images", exist_ok=True)
             sha1 = hashlib.sha1(data).hexdigest()
             path = f"static/images/{sha1}.jpg"
             if not os.path.exists(path):
                 im.save(path, format="JPEG", quality=88, optimize=True)
+
             return "/" + path, sha1
         except Exception as e:
             print(f"[IMG] convert/save fail {url}: {e}")
             return None, None
+
     except Exception as e:
         print(f"[IMG] download failed for {url}: {e}")
         return None, None
@@ -821,26 +669,35 @@ def insert_post(title_fr, body_text, link, source, img_url):
         default_img = get_setting("default_image_url", "").strip()
         if default_img:
             img_url = default_img
-    # 2) download/conversion ; si ça échoue → retente avec l'image par défaut
+
+    # 2) download/conversion ; si ça échoue → retente encore une fois avec l'image par défaut
     local_path, sha1 = download_image(img_url) if img_url else (None, None)
     if (not local_path or not sha1):
         default_img = get_setting("default_image_url", "").strip()
         if default_img and (not img_url or img_url != default_img):
             local_path, sha1 = download_image(default_img)
+
     # 3) exigence finale
     if REQUIRE_IMAGE and (not local_path or not sha1):
         print("[POST] rejet: aucune image utilisable (article + défaut)")
         return False
+
     # anti-doublon image
     if sha1:
         con = db()
         try:
-            if con.execute("SELECT 1 FROM posts WHERE image_sha1=?", (sha1,)).fetchone():
+            if con.execute("SELECT 1 FROM posts WHERE image_sha1=?", (sha1)).fetchone():
                 return False
+        except Exception:
+            # sqlite param fix
+            pass
         finally:
-            con.close()
+            try: con.close()
+            except: pass
+
     now = datetime.now(timezone.utc).isoformat()
     status = "published" if AUTO_PUBLISH else "draft"
+
     con = db()
     try:
         con.execute("""INSERT INTO posts
@@ -856,6 +713,7 @@ def insert_post(title_fr, body_text, link, source, img_url):
         con.close()
 
 def scrape_rss_once(feeds):
+    MIN_SOURCE_CHARS = 40
     created, skipped = 0, 0
     for feed in feeds:
         try:
@@ -866,6 +724,7 @@ def scrape_rss_once(feeds):
                 print(f"[FEED] fetch/parse error {feed}: {e}")
                 skipped += 1
                 continue
+
             feed_title = fp.feed.get("title","") if getattr(fp, "feed", None) else ""
             for e in getattr(fp, "entries", [])[:20]:
                 try:
@@ -873,4 +732,479 @@ def scrape_rss_once(feeds):
                     if not link or already_have_link(link):
                         print("[RSS] skip: link vide/doublon", link)
                         skipped += 1; continue
-                    title_src = normalize_title((e.get("title") or "(Sans titre)").
+
+                    title_src = (e.get("title") or "(Sans titre)").strip()
+
+                    # page → extraction texte
+                    page_html = ""
+                    try:
+                        page_html = http_get(link)
+                        if page_html:
+                            page_html = clean_source_html(page_html)
+                    except Exception as ee:
+                        print(f"[PAGE] fetch fail {link}: {ee}")
+                    article_text = extract_article_text(page_html) if page_html else ""
+                    if not article_text:
+                        article_text = BeautifulSoup(html_from_entry(e), "html.parser").get_text(" ", strip=True)
+                    if not article_text or len(article_text) < MIN_SOURCE_CHARS:
+                        print("[RSS] skip: texte trop court (<40 chars)", link)
+                        skipped += 1; continue
+
+                    # image : tente la page / RSS, sinon image par défaut
+                    img_url = get_image_from_entry(e, page_html=page_html, page_url=link)
+                    if not img_url:
+                        default_img = get_setting("default_image_url", "").strip()
+                        if default_img:
+                            img_url = default_img
+                    if REQUIRE_IMAGE and not img_url:
+                        print("[RSS] skip: pas d'image", link)
+                        skipped += 1
+                        continue
+
+                    # FR
+                    title_fr, body_text, _sure_fr = rewrite_article_fr(title_src, article_text)
+                    if not body_text:
+                        print("[RSS] skip: réécriture vide", link)
+                        skipped += 1; continue
+
+                    if insert_post(title_fr, body_text, link, feed_title, img_url):
+                        created += 1
+                    else:
+                        skipped += 1
+                except Exception as ex:
+                    skipped += 1
+                    print(f"[RSS ENTRY] error: {ex}")
+                    traceback.print_exc()
+        except Exception as e:
+            print(f"[FEED] parse error {feed}: {e}")
+            continue
+    return created, skipped
+
+def normalize_url(base, href):
+    if not href: return None
+    href = href.strip()
+    if href.startswith("#"): return None
+    return urljoin(base, href)
+
+def scrape_index_once(scrapers_json):
+    MIN_SOURCE_CHARS = 40
+    created, skipped = 0, 0
+    for cfg in scrapers_json:
+        try:
+            name = cfg.get("name","")
+            index_url = cfg["index_url"]
+            link_sel  = cfg["link_selector"]
+            max_items = int(cfg.get("max_items", 6))
+            html = http_get(index_url)
+            soup = BeautifulSoup(html, "html.parser")
+            links = []
+            for a in soup.select(link_sel)[: max_items * 3]:
+                href = a.get("href")
+                full = normalize_url(index_url, href)
+                if full and full not in links:
+                    links.append(full)
+                if len(links) >= max_items:
+                    break
+
+            for link in links:
+                try:
+                    if already_have_link(link):
+                        print("[SCRAPER] skip: doublon", link)
+                        skipped += 1; continue
+                    page = http_get(link)
+                    page = clean_source_html(page)
+                    psoup = BeautifulSoup(page, "html.parser")
+
+                    # titre source (pour traduction simple)
+                    title_sel = cfg.get("title_selector","h1")
+                    title_src = soup_select_attr(psoup, title_sel) or "(Sans titre)"
+
+                    # contenu
+                    content_sel = cfg.get("content_selector") or ""
+                    node_text = ""
+                    if content_sel:
+                        node = psoup.select_one(content_sel)
+                        if node:
+                            node_text = " ".join(p.get_text(" ", strip=True) for p in (node.find_all(["p","h2","li"]) or [node]))
+                            node_text = re.sub(r"\s+", " ", node_text).strip()
+                    if not node_text:
+                        node_text = extract_article_text(page)
+                    if not node_text or len(node_text) < MIN_SOURCE_CHARS:
+                        print("[SCRAPER] skip: texte trop court (<40 chars)", link)
+                        skipped += 1; continue
+
+                    # image : page / meta / fallback par défaut
+                    img = None
+                    for isel in cfg.get("image_selectors", []):
+                        val = soup_select_attr(psoup, isel)
+                        if val:
+                            img = urljoin(link, val)
+                            break
+                    if not img:
+                        img = find_main_image_in_html(page, base_url=link)
+                    if not img:
+                        default_img = get_setting("default_image_url", "").strip()
+                        if default_img:
+                            img = default_img
+                    if REQUIRE_IMAGE and not img:
+                        print("[SCRAPER] skip: pas d'image", link)
+                        skipped += 1
+                        continue
+
+                    # FR
+                    title_fr, body_text, _sure = rewrite_article_fr(title_src, node_text)
+                    if not body_text:
+                        print("[SCRAPER] skip: réécriture vide", link)
+                        skipped += 1; continue
+
+                    if insert_post(title_fr, body_text, link, name, img):
+                        created += 1
+                    else:
+                        skipped += 1
+                except Exception as inner:
+                    skipped += 1
+                    print(f"[SCRAPER:{name}] article error:", inner)
+        except Exception as e:
+            print("[SCRAPER] config error:", e)
+    return created, skipped
+
+# -------- utilitaire import (1 fois) --------
+def run_import_once():
+    """Import RSS + scrapers une seule fois, renvoie (created, skipped, detail_msg)."""
+    # Vérification image par défaut si image obligatoire
+    if REQUIRE_IMAGE:
+        default_img = get_setting("default_image_url", "").strip()
+        if not default_img:
+            msg = ("Image par défaut manquante : configure 'Image par défaut (URL)' dans l’admin "
+                   "car REQUIRE_IMAGE=True. Sinon tous les articles sans image seront ignorés.")
+            print("[IMPORT] ", msg)
+            set_setting("last_import_result", msg)
+            return 0, 0, msg
+
+    feeds_txt = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
+    feed_list = [u.strip() for u in feeds_txt.splitlines() if u.strip()]
+    try:
+        scrapers_cfg = _json.loads(get_setting("scrapers_json", _json.dumps(DEFAULT_SCRAPERS)))
+        if not isinstance(scrapers_cfg, list):
+            raise ValueError("Le JSON de scrapers doit être une liste []")
+    except Exception as e:
+        msg = f"Config sites JSON invalide: {e}"
+        set_setting("last_import_result", msg)
+        return 0, 0, msg
+
+    c1, s1 = scrape_rss_once(feed_list)
+    c2, s2 = scrape_index_once(scrapers_cfg)
+    total_c, total_s = (c1 + c2), (s1 + s2)
+    msg = f"Import OK: {total_c} créés, {total_s} ignorés (RSS {c1}/{s1}, Sites {c2}/{s2})"
+    set_setting("last_import_result", msg)
+    return total_c, total_s, msg
+
+# ================== SCHEDULER (publication auto) ==================
+def publish_due_loop():
+    while True:
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            con = db()
+            try:
+                rows = con.execute(
+                    "SELECT id FROM posts WHERE status='scheduled' AND publish_at IS NOT NULL AND publish_at <= ?",
+                    (now,)).fetchall()
+                if rows:
+                    ids = [r["id"] for r in rows]
+                    con.execute(
+                        f"UPDATE posts SET status='published', updated_at=? WHERE id IN ({','.join('?'*len(ids))})",
+                        (now, *ids)
+                    )
+                    con.commit()
+                    print(f"[SCHED] Published IDs: {ids}")
+            finally:
+                con.close()
+        except Exception as e:
+            print("[SCHED] loop error:", e)
+        time.sleep(30)
+
+# ======== Boucle d'import automatique (RSS + scrapers) ========
+def import_loop():
+    while True:
+        try:
+            print("[IMPORT LOOP] cycle…")
+            run_import_once()
+        except Exception as e:
+            msg = f"Erreur (auto import): {e}\n{traceback.format_exc()}"
+            print("[IMPORT LOOP] fatal:", msg)
+            set_setting("last_import_result", msg)
+        time.sleep(max(60, IMPORT_INTERVAL_MIN * 60))
+
+# ================== UI ==================
+LAYOUT = """
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{title}}</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+<body class="container">
+<nav>
+  <ul><li><strong>{{appname}}</strong></li></ul>
+  <ul>
+    <li><a href="{{ url_for('home') }}">Accueil</a></li>
+    <li><a href="{{ url_for('rss_xml') }}" target="_blank">RSS</a></li>
+    {% if session.get('ok') %}
+      <li><a href="{{ url_for('admin') }}">Admin</a></li>
+      <li><a href="{{ url_for('logout') }}">Déconnexion</a></li>
+    {% else %}
+      <li><a href="{{ url_for('admin') }}">Connexion</a></li>
+    {% endif %}
+  </ul>
+</nav>
+<main>
+  {% with m=get_flashed_messages() %}{% if m %}<article>{% for x in m %}<p>{{x}}</p>{% endfor %}</article>{% endif %}{% endwith %}
+  {{ body|safe }}
+</main>
+<footer><small>&copy; {{year}} — {{appname}}</small></footer>
+</body>"""
+def page(body, title=""):
+    return render_template_string(LAYOUT, body=body, title=title or APP_NAME,
+                                 appname=APP_NAME, year=datetime.now().year)
+
+@app.get("/health")
+def health():
+    return "OK"
+
+@app.get("/")
+def home():
+    con = db()
+    try:
+        rows = con.execute("SELECT * FROM posts WHERE status='published' ORDER BY id DESC LIMIT 50").fetchall()
+    finally:
+        con.close()
+    if not rows:
+        return page("<h2>Dernières publications</h2><p>Aucune publication pour l’instant.</p>", "Publications")
+    cards = []
+    for r in rows:
+        img = f"<img src='{r['image_url']}' alt='' style='max-width:100%;height:auto'>" if r["image_url"] else ""
+        created = (r['created_at'] or '')[:16].replace('T',' ')
+        body_html = (r['body'] or '').replace("\n", "<br>")
+        cards.append(f"<article><header><h3>{r['title']}</h3><small>{created}</small></header>{img}<p>{body_html}</p></article>")
+    return page("<h2>Dernières publications</h2>" + "".join(cards), "Publications")
+
+@app.get("/rss.xml")
+def rss_xml():
+    con = db()
+    try:
+        rows = con.execute("SELECT * FROM posts WHERE status='published' ORDER BY id DESC LIMIT 100").fetchall()
+    finally:
+        con.close()
+    items = []
+    for r in rows:
+        title = (r["title"] or "").replace("&","&amp;")
+        desc  = (r["body"] or "").replace("&","&amp;")
+        enclosure = f"<enclosure url='{request.url_root.rstrip('/') + r['image_url']}' type='image/jpeg'/>" if r["image_url"] else ""
+        pub   = datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S %z')
+        items.append(f"<item><title>{title}</title><link>{request.url_root}</link><guid isPermaLink='false'>{r['id']}</guid><description><![CDATA[{desc}]]></description>{enclosure}<pubDate>{pub}</pubDate></item>")
+    rss = f"<?xml version='1.0' encoding='UTF-8'?><rss version='2.0'><channel><title>{APP_NAME} — Flux</title><link>{request.url_root}</link><description>Articles publiés</description>{''.join(items)}</channel></rss>"
+    return Response(rss, mimetype="application/rss+xml")
+
+@app.route("/admin", methods=["GET","POST"])
+def admin():
+    if request.method == "POST" and not session.get("ok"):
+        if request.form.get("password") == ADMIN_PASS:
+            session["ok"] = True
+            return redirect(url_for("admin"))
+        flash("Mot de passe incorrect."); return redirect(url_for("admin"))
+
+    if not session.get("ok"):
+        return page("""<h3>Connexion</h3><form method="post">
+          <input type="password" name="password" placeholder="Mot de passe" required>
+          <button>Entrer</button></form>""", "Connexion")
+
+    feeds = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
+    openai_key   = get_setting("openai_key", ENV_OPENAI_KEY)
+    openai_model = get_setting("openai_model", ENV_OPENAI_MODEL)
+    default_image = get_setting("default_image_url", "").strip()
+    scrapers_json_txt = get_setting("scrapers_json", _json.dumps(DEFAULT_SCRAPERS, ensure_ascii=False, indent=2))
+    last_result = get_setting("last_import_result", "").strip()
+
+    con = db()
+    try:
+        drafts    = con.execute("SELECT * FROM posts WHERE status='draft' ORDER BY id DESC").fetchall()
+        scheduled = con.execute("SELECT * FROM posts WHERE status='scheduled' ORDER BY publish_at ASC").fetchall()
+        pubs      = con.execute("SELECT * FROM posts WHERE status='published' ORDER BY id DESC").fetchall()
+    finally:
+        con.close()
+
+    def card(r, published=False):
+        img = f"<img src='{r['image_url']}' style='max-width:200px'>" if r["image_url"] else "<small style='color:#900'>⚠️ Pas d'image</small>"
+        pub_at = (r['publish_at'] or '')[:16]
+        state_btns = ("<button name='action' value='unpublish' class='secondary'>⏸️ Dépublier</button>"
+                      if published else
+                      "<button name='action' value='publish' class='secondary'>✅ Publier maintenant</button>")
+        return f"""
+        <details>
+          <summary><b>{r['title'] or '(Sans titre)'}</b> — <small>{r['status']}</small></summary>
+          {img}
+          <form method="post" action="{url_for('save', post_id=r['id'])}">
+            <label>Titre<input name="title" value="{(r['title'] or '').replace('"','&quot;')}"></label>
+            <label>Contenu<textarea name="body" rows="6">{r['body'] or ''}</textarea></label>
+            <div class="grid">
+              <button name="action" value="save">💾 Enregistrer</button>
+              {state_btns}
+              <button name="action" value="delete" class="contrast">🗑️ Supprimer</button>
+            </div>
+            <label>Publier à (UTC)
+              <input type="datetime-local" name="publish_at" value="{pub_at}">
+            </label>
+            <div class="grid">
+              <button name="action" value="schedule" class="secondary">🕒 Planifier</button>
+            </div>
+          </form>
+        </details>"""
+
+    body = f"""
+    <h3>Paramètres</h3>
+    {f"<p><mark>{last_result}</mark></p>" if last_result else ""}
+    <article>
+      <form method="post" action="{url_for('save_settings')}">
+        <div class="grid">
+          <label>OpenAI API Key (secours si ENV absente)
+            <input type="password" name="openai_key" placeholder="sk-..." value="{openai_key}">
+          </label>
+          <label>OpenAI Model
+            <input name="openai_model" placeholder="gpt-4o-mini" value="{openai_model}">
+          </label>
+        </div>
+        <label>Image par défaut (URL)
+          <input name="default_image_url" placeholder="https://..." value="{default_image}">
+        </label>
+        <label>Sources RSS (une URL par ligne)
+          <textarea name="feeds" rows="5">{feeds}</textarea>
+        </label>
+        <label>Scrapers de sites (JSON)</label>
+        <textarea name="scrapers_json" rows="18" style="font-family:monospace">{scrapers_json_txt}</textarea>
+        <button>💾 Enregistrer les paramètres</button>
+      </form>
+
+      <form method="post" action="{url_for('import_now')}" style="margin-top:1rem">
+        <button type="submit">🔁 Importer maintenant (RSS + Scraping)</button>
+      </form>
+      <p><small>Import automatique toutes les {IMPORT_INTERVAL_MIN} min. • Cron HTTP: <code>{request.url_root}cron/import</code></small></p>
+    </article>
+
+    <h4>Brouillons</h4>{''.join(card(r) for r in drafts) or "<p>Aucun brouillon.</p>"}
+    <h4>Planifiés</h4>{''.join(card(r) for r in scheduled) or "<p>Aucun article planifié.</p>"}
+    <h4>Publiés</h4>{''.join(card(r, True) for r in pubs) or "<p>Rien de publié.</p>"}
+    <p>Flux public : <code>{request.url_root}rss.xml</code></p>
+    """
+    return page(body, "Admin")
+
+@app.post("/save-settings")
+def save_settings():
+    if not session.get("ok"): return redirect(url_for("admin"))
+    set_setting("openai_key", request.form.get("openai_key","").strip())
+    set_setting("openai_model", request.form.get("openai_model","").strip())
+    set_setting("feeds", request.form.get("feeds",""))
+    set_setting("default_image_url", request.form.get("default_image_url","").strip())
+    scrapers_txt = request.form.get("scrapers_json","").strip()
+    try:
+        _json.loads(scrapers_txt or "[]")
+        set_setting("scrapers_json", scrapers_txt or "[]")
+        flash("Paramètres enregistrés.")
+    except Exception as e:
+        flash(f"Config sites JSON invalide : {e}")
+    return redirect(url_for("admin"))
+
+@app.post("/import-now")
+def import_now():
+    if not session.get("ok"): return redirect(url_for("admin"))
+    def worker():
+        try:
+            c, s, msg = run_import_once()
+            print("[MANUAL IMPORT]", msg)
+        except Exception as e:
+            msg = f"Erreur : {e}\n{traceback.format_exc()}"
+            print("[IMPORT WORKER] fatal:", msg)
+            set_setting("last_import_result", msg)
+    threading.Thread(target=worker, daemon=True).start()
+    flash("Import lancé en arrière-plan. Recharge l’admin dans ~1 minute pour voir le résultat.")
+    return redirect(url_for("admin"))
+
+@app.get("/import-now")
+def import_now_get():
+    flash("Utilise le bouton « Importer maintenant » dans l’admin.")
+    return redirect(url_for("admin"))
+
+@app.get("/cron/import")
+def cron_import():
+    c, s, msg = run_import_once()
+    return f"{msg}\n", 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+@app.post("/save/<int:post_id>")
+def save(post_id):
+    if not session.get("ok"): return redirect(url_for("admin"))
+    action     = request.form.get("action","save")
+    title      = strip_tags(request.form.get("title","").strip())
+    body       = strip_tags(request.form.get("body","").strip())
+    publish_at = request.form.get("publish_at","").strip()
+
+    if body:
+        # garantit [TARGET_MIN_WORDS, TARGET_MAX_WORDS] + signature + nettoyage
+        body = " ".join(_tokenize_words(body))
+        if _word_count(body) > TARGET_MAX_WORDS:
+            body = " ".join(_tokenize_words(body)[:TARGET_MAX_WORDS])
+        body = ensure_min_words(body, body, TARGET_MIN_WORDS)
+        body = clean_body_text(body)
+
+    # Si l'admin modifie le titre manuellement, on normalise simplement
+    title = normalize_title(title)
+
+    con = db()
+    try:
+        con.execute("UPDATE posts SET title=?, body=?, updated_at=? WHERE id=?",
+                    (title, body, datetime.now(timezone.utc).isoformat(timespec="minutes"), post_id))
+        if action == "publish":
+            row = con.execute("SELECT image_url FROM posts WHERE id=?", (post_id,)).fetchone()
+            if REQUIRE_IMAGE and (not row or not row["image_url"]):
+                flash("Publication refusée : une image est obligatoire.")
+            else:
+                con.execute("UPDATE posts SET status='published', publish_at=NULL WHERE id=?", (post_id,))
+                flash("Publié immédiatement.")
+        elif action == "unpublish":
+            con.execute("UPDATE posts SET status='draft', publish_at=NULL WHERE id=?", (post_id,))
+            flash("Dépublié.")
+        elif action == "schedule":
+            if not publish_at:
+                flash("Choisis une date/heure (UTC) pour planifier.")
+            else:
+                iso_utc = publish_at if len(publish_at) == 16 else publish_at[:16]
+                iso_utc += ":00+00:00" if len(iso_utc) == 16 else ""
+                con.execute("UPDATE posts SET status='scheduled', publish_at=? WHERE id=?", (iso_utc, post_id))
+                flash(f"Planifié pour {iso_utc} (UTC).")
+        elif action == "delete":
+            con.execute("DELETE FROM posts WHERE id=?", (post_id,))
+            flash("Supprimé.")
+        else:
+            flash("Enregistré.")
+        con.commit()
+    finally:
+        con.close()
+    return redirect(url_for("admin"))
+
+@app.get("/logout")
+def logout():
+    session.clear(); return redirect(url_for("home"))
+
+@app.get("/console")
+def alias_console():
+    return redirect(url_for("admin"))
+
+# --------- boot ---------
+init_db()
+bootstrap_openai_key()
+# Import immédiat au démarrage (utile si l'hébergeur coupe les threads)
+try:
+    run_import_once()
+except Exception as e:
+    print("[BOOT] import initial failed:", e)
+
+threading.Thread(target=publish_due_loop, daemon=True).start()
+threading.Thread(target=import_loop, daemon=True).start()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
