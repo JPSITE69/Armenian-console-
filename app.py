@@ -1,8 +1,8 @@
-# app.py
+# app.py — Console Arménienne (auto-import + auto-publish + image obligatoire + titres propres + clé OpenAI une fois)
 from flask import Flask, request, redirect, url_for, Response, render_template_string, session, flash
 import sqlite3, os, hashlib, io, traceback, re, threading, time, json as _json
-from datetime import datetime, timezone, timedelta
-from urllib.parse import urljoin, urlparse
+from datetime import datetime, timezone
+from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 import feedparser
@@ -14,10 +14,10 @@ ADMIN_PASS = os.environ.get("ADMIN_PASS", "armenie")
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me")
 DB_PATH    = "site.db"
 
-# ---- Nouveaux réglages automatiques ----
-AUTO_PUBLISH = True  # publie automatiquement tout nouvel article
-REQUIRE_IMAGE = True # image obligatoire (sinon l'article est ignoré)
-IMPORT_INTERVAL_MIN = int(os.environ.get("IMPORT_INTERVAL_MIN", "15")) # import automatique toutes les N minutes
+# Auto
+AUTO_PUBLISH = True          # Publie immédiatement tout nouvel article
+REQUIRE_IMAGE = True         # Photo obligatoire
+IMPORT_INTERVAL_MIN = int(os.environ.get("IMPORT_INTERVAL_MIN", "10"))  # boucle auto (minutes)
 
 # ---- RSS par défaut
 DEFAULT_FEEDS = [
@@ -26,7 +26,6 @@ DEFAULT_FEEDS = [
     "https://news.am/eng/rss/",
     "https://factor.am/feed",
     "https://hetq.am/hy/rss",
-    # NE PAS AJOUTER l'API JSON d'Azatutyun ici (ça n'est pas RSS) ; on l'attrape via scraping (voir DEFAULT_SCRAPERS)
 ]
 
 # ---- Scrapers d'index par défaut (éditables dans /admin)
@@ -174,9 +173,36 @@ def set_setting(key, value):
     finally:
         con.close()
 
+# --- Bootstrap / cache OpenAI (clé une seule fois) ---
+_OPENAI_CACHE = {"key": None, "model": None}
+
+def bootstrap_openai_key():
+    db_key = get_setting("openai_key", "").strip()
+    if not db_key and ENV_OPENAI_KEY:
+        set_setting("openai_key", ENV_OPENAI_KEY.strip())
+    db_model = get_setting("openai_model", "").strip()
+    if not db_model and ENV_OPENAI_MODEL:
+        set_setting("openai_model", ENV_OPENAI_MODEL.strip())
+
+def active_openai():
+    if _OPENAI_CACHE["key"] and _OPENAI_CACHE["model"]:
+        return _OPENAI_CACHE["key"], _OPENAI_CACHE["model"]
+    key = get_setting("openai_key", ENV_OPENAI_KEY).strip()
+    model = get_setting("openai_model", ENV_OPENAI_MODEL).strip()
+    _OPENAI_CACHE["key"] = key
+    _OPENAI_CACHE["model"] = model
+    return key, model
+
 # ================== UTILS TEXTE ==================
 TAG_RE = re.compile(r"<[^>]+>")
 FR_TOKENS = set(" le la les un une des du de au aux et en sur pour par avec dans que qui ne pas est été sont était selon afin aussi plus leur lui ses ces cette ce cela donc ainsi tandis alors contre entre vers depuis sans sous après avant comme lorsque tandis que où dont même".split())
+
+TITLE_MIN = 20
+TITLE_MAX = 110
+SITE_SUFFIX_PAT = re.compile(
+    r"\s*(?:[-–|»]\s*)?(?:CivilNet|Armenpress|News\.am|Factor\.am|Hetq|Azatutyun|RFE/RL)\s*$",
+    re.I
+)
 
 def strip_tags(s: str) -> str:
     return TAG_RE.sub("", s or "")
@@ -189,30 +215,64 @@ def looks_french(text: str) -> bool:
     hits = sum(1 for w in words[:80] if w in FR_TOKENS)
     return hits >= 5
 
-def active_openai():
-    key = get_setting("openai_key", ENV_OPENAI_KEY)
-    model = get_setting("openai_model", ENV_OPENAI_MODEL)
-    return (key.strip(), model.strip())
+def _smart_truncate(s: str, limit: int) -> str:
+    if len(s) <= limit:
+        return s
+    cut = s[:limit].rsplit(" ", 1)[0].strip(",.;:—-– ")
+    return cut if len(cut) >= TITLE_MIN else s[:limit].rstrip()
+
+def _clean_punct(s: str) -> str:
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"[\[\(](?:photos?|video|vidéo|live|mise à jour|update)[\]\)]", "", s, flags=re.I)
+    s = re.sub(r"[\[\(].{0,40}?[\]\)]\s*$", "", s)
+    s = re.sub(r"[“”]", '"', s)
+    s = re.sub(r"[‘’]", "'", s)
+    s = s.strip(" -–|:;,.")
+    return s
+
+def _sentence_case(fr: str) -> str:
+    if not fr: return fr
+    fr = fr.strip()
+    if fr.isupper() and len(fr) > 4:
+        fr = fr.capitalize()
+    if fr and fr[0].islower():
+        fr = fr[0].upper() + fr[1:]
+    return fr
+
+def normalize_title(src: str) -> str:
+    if not src: return "Actualité"
+    t = src.strip()
+    t = SITE_SUFFIX_PAT.sub("", t)
+    t = _clean_punct(t)
+    t = re.sub(r"[^\w\sÀ-ÖØ-öø-ÿ’'\"!?.,:;()-–—]", "", t)
+    t = _sentence_case(t)
+    if len(t) > TITLE_MAX:
+        t = _smart_truncate(t, TITLE_MAX)
+    t = t.rstrip()
+    if t.endswith(("—", "–", "-", ":", ";", ",")):
+        t = t[:-1].rstrip()
+    return t or "Actualité"
 
 def _title_from_text_fallback(fr_text: str) -> str:
     t = (fr_text or "").strip()
-    if not t:
-        return "Actualité"
-    words = t.split()
-    base = " ".join(words[:10]).strip().rstrip(".,;:!?")
-    base = base[:80]
-    return base[:1].upper() + base[1:]
+    if not t: return "Actualité"
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9'’\-]+", t)
+    base = " ".join(words[:16]).strip()
+    base = re.sub(r"\s+", " ", base)
+    base = base[:TITLE_MAX]
+    base = normalize_title(base)
+    return base
 
 def ensure_signature(body: str) -> str:
     b = (body or "").rstrip()
-    if not b.endswith("- lesarmenien.com"):
-        b += "\n\n- lesarmeniens.com"
+    if not b.endswith("- LesArmeniens.com"):
+        b += "\n\n- LesArmeniens.com"
     return b
 
 def rewrite_article_fr(title_src: str, raw_text: str):
-    """Retourne (title_fr, body_fr, sure_fr). Force FR + signature lesarmeniens.com."""
+    """Retourne (title_fr, body_fr, sure_fr). Force FR + signature LesArmeniens.com + normalisation titre."""
     if not raw_text:
-        return (title_src or "Actualité", "", False)
+        return (normalize_title(title_src or "Actualité"), "", False)
 
     key, model = active_openai()
     clean_input = strip_tags(raw_text)
@@ -223,7 +283,7 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             "Traduis et réécris en FRANÇAIS le Titre et le Corps de l'article ci-dessous. "
             "Style neutre, informatif. 150–220 mots pour le corps. "
             "RENVOIE UNIQUEMENT du JSON avec les clés 'title' et 'body'. "
-            "Le 'body' doit être du TEXTE BRUT (pas de balises) et DOIT se terminer par: - lesarmeniens.com.\n\n"
+            "Le 'body' doit être du TEXTE BRUT (pas de balises) et DOIT se terminer par: - LesArmeniens.com.\n\n"
             f"Titre (source): {title_src}\n"
             f"Texte (source): {clean_input}"
         )
@@ -253,6 +313,7 @@ def rewrite_article_fr(title_src: str, raw_text: str):
         body_fr = ensure_signature(body_fr)
         if not title_fr:
             title_fr = _title_from_text_fallback(body_fr)
+        title_fr = normalize_title(title_fr)
         return title_fr, body_fr
 
     if key:
@@ -263,15 +324,16 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             t2, b2 = call_openai()
             if looks_french(b2) and looks_french(t2):
                 return (t2, b2, True)
-            return (_title_from_text_fallback(b2), ensure_signature(b2), False)
+            tfb = _title_from_text_fallback(b2)
+            return (normalize_title(tfb), ensure_signature(b2), False)
         except Exception as e:
             print(f"[AI] rewrite_article_fr failed: {e}")
 
     # Fallback local
     fr_body = " ".join(strip_tags(raw_text).split()[:220]).strip()
     fr_title = _title_from_text_fallback(fr_body)
-    fr_body = ensure_signature(fr_body)
-    return (fr_title, fr_body, False)
+    fr_body  = ensure_signature(fr_body)
+    return (normalize_title(fr_title), fr_body, False)
 
 # ================== HTTP & IMAGES ==================
 def http_get(url, timeout=20):
@@ -285,11 +347,8 @@ def http_get(url, timeout=20):
     return r.text
 
 def fetch_xml(url, timeout=25):
-    """Télécharge un flux RSS/Atom avec UA propre, renvoie le texte."""
     r = requests.get(
-        url,
-        timeout=timeout,
-        allow_redirects=True,
+        url, timeout=timeout, allow_redirects=True,
         headers={
             "User-Agent": "Console-Armenie/1.0 (+https://armenian-console.onrender.com)",
             "Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, */*;q=0.8",
@@ -301,10 +360,6 @@ def fetch_xml(url, timeout=25):
     return r.text
 
 def soup_select_attr(soup, selector):
-    """
-    Gère les pseudo '::content' (meta/@content) et '::src' (img/@src).
-    Renvoie la première valeur trouvée ou None.
-    """
     attr = None
     sel = selector
     if "::content" in selector:
@@ -317,30 +372,25 @@ def soup_select_attr(soup, selector):
     if attr:
         val = tag.get(attr)
         return val if val else None
-    # sinon, texte
     return tag.get_text(" ", strip=True)
 
 def find_main_image_in_html(html, base_url=None):
     soup = BeautifulSoup(html, "html.parser")
-    # og/twitter
     for sel in ["meta[property='og:image']","meta[name='twitter:image']"]:
         m = soup.select_one(sel)
         if m and m.get("content"):
             return urljoin(base_url or "", m["content"])
-    # première image dans article
     a = soup.find("article")
     if a:
         imgtag = a.find("img")
         if imgtag and imgtag.get("src"):
             return urljoin(base_url or "", imgtag["src"])
-    # fallback: première image
     imgtag = soup.find("img")
     if imgtag and imgtag.get("src"):
         return urljoin(base_url or "", imgtag["src"])
     return None
 
 def get_image_from_entry(entry, page_html=None, page_url=None):
-    # 1) champs RSS media/enclosure
     try:
         media = entry.get("media_content") or entry.get("media_thumbnail")
         if isinstance(media, list) and media:
@@ -357,7 +407,6 @@ def get_image_from_entry(entry, page_html=None, page_url=None):
                     return urljoin(page_url or "", href)
     except Exception:
         pass
-    # 2) img dans le contenu RSS (summary/content)
     for k in ("content","summary","description"):
         v = entry.get(k)
         if not v: continue
@@ -373,7 +422,6 @@ def get_image_from_entry(entry, page_html=None, page_url=None):
             imgtag = s.find("img")
             if imgtag and imgtag.get("src"):
                 return urljoin(page_url or "", imgtag["src"])
-    # 3) page HTML
     if page_html:
         return find_main_image_in_html(page_html, base_url=page_url)
     return None
@@ -385,7 +433,6 @@ def download_image(url):
         r.raise_for_status()
         data = r.content
         sha1 = hashlib.sha1(data).hexdigest()
-        # valide l'image
         try:
             im = Image.open(io.BytesIO(data))
             im.verify()
@@ -446,10 +493,9 @@ def insert_post(title_fr, body_text, link, source, img_url):
 
     local_path, sha1 = download_image(img_url) if img_url else (None, None)
     if REQUIRE_IMAGE and (not local_path or not sha1):
-        # pas d'image valide ⇒ on ignore
         return False
 
-    # anti-doublon sur image (facultatif mais utile)
+    # anti-doublon sur image
     if sha1:
         con = db()
         try:
@@ -475,7 +521,7 @@ def insert_post(title_fr, body_text, link, source, img_url):
     finally:
         con.close()
 
-def scrape_rss_once(feeds, default_image_url=None):
+def scrape_rss_once(feeds):
     created, skipped = 0, 0
     for feed in feeds:
         try:
@@ -494,7 +540,7 @@ def scrape_rss_once(feeds, default_image_url=None):
                     if not link or already_have_link(link):
                         skipped += 1; continue
 
-                    title_src = (e.get("title") or "(Sans titre)").strip()
+                    title_src = normalize_title((e.get("title") or "(Sans titre)").strip())
 
                     # page → extraction texte
                     page_html = ""
@@ -538,7 +584,7 @@ def normalize_url(base, href):
     if href.startswith("#"): return None
     return urljoin(base, href)
 
-def scrape_index_once(scrapers_json, default_image_url=None):
+def scrape_index_once(scrapers_json):
     created, skipped = 0, 0
     for cfg in scrapers_json:
         try:
@@ -549,7 +595,7 @@ def scrape_index_once(scrapers_json, default_image_url=None):
             html = http_get(index_url)
             soup = BeautifulSoup(html, "html.parser")
             links = []
-            for a in soup.select(link_sel)[: max_items * 3]:  # un peu large, on dédoublonne ensuite
+            for a in soup.select(link_sel)[: max_items * 3]:
                 href = a.get("href")
                 full = normalize_url(index_url, href)
                 if full and full not in links:
@@ -567,6 +613,7 @@ def scrape_index_once(scrapers_json, default_image_url=None):
                     # titre
                     title_sel = cfg.get("title_selector","h1")
                     title_src = soup_select_attr(psoup, title_sel) or "(Sans titre)"
+                    title_src = normalize_title(title_src)
 
                     # contenu
                     content_sel = cfg.get("content_selector") or ""
@@ -634,17 +681,14 @@ def publish_due_loop():
             print("[SCHED] loop error:", e)
         time.sleep(30)
 
-# ======== NOUVEAU : boucle d'import automatique (RSS + scrapers) ========
+# ======== Boucle d'import automatique (RSS + scrapers) ========
 def import_loop():
     while True:
         try:
             print("[IMPORT LOOP] démarrage cycle...")
-            default_image = get_setting("default_image_url","").strip() or None
-
             # RSS
             feeds_txt = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
             feed_list = [u.strip() for u in feeds_txt.splitlines() if u.strip()]
-
             # Scrapers
             try:
                 scrapers_cfg = _json.loads(get_setting("scrapers_json", _json.dumps(DEFAULT_SCRAPERS)))
@@ -653,17 +697,14 @@ def import_loop():
             except Exception as e:
                 print(f"[IMPORT LOOP] Config sites JSON invalide: {e}")
                 scrapers_cfg = []
-
-            c1, s1 = scrape_rss_once(feed_list, default_image_url=default_image)
-            c2, s2 = scrape_index_once(scrapers_cfg, default_image_url=default_image)
+            c1, s1 = scrape_rss_once(feed_list)
+            c2, s2 = scrape_index_once(scrapers_cfg)
             set_setting("last_import_result", f"OK (auto): {c1+c2} nouveaux, {s1+s2} ignorés.")
             print(f"[IMPORT LOOP] terminé: {c1+c2} nouveaux, {s1+s2} ignorés.")
         except Exception as e:
             msg = f"Erreur (auto import): {e}\n{traceback.format_exc()}"
             print("[IMPORT LOOP] fatal:", msg)
             set_setting("last_import_result", msg)
-
-        # pause
         time.sleep(max(60, IMPORT_INTERVAL_MIN * 60))
 
 # ================== UI ==================
@@ -833,7 +874,6 @@ def save_settings():
     set_setting("feeds", request.form.get("feeds",""))
     set_setting("default_image_url", request.form.get("default_image_url","").strip())
     scrapers_txt = request.form.get("scrapers_json","").strip()
-    # Valide JSON pour éviter l'erreur "Config sites JSON invalide"
     try:
         _json.loads(scrapers_txt or "[]")
         set_setting("scrapers_json", scrapers_txt or "[]")
@@ -845,13 +885,10 @@ def save_settings():
 @app.post("/import-now")
 def import_now():
     if not session.get("ok"): return redirect(url_for("admin"))
-    default_image = get_setting("default_image_url","").strip() or None
 
-    # RSS
     feeds_txt = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
     feed_list = [u.strip() for u in feeds_txt.splitlines() if u.strip()]
 
-    # Scrapers
     try:
         scrapers_cfg = _json.loads(get_setting("scrapers_json", _json.dumps(DEFAULT_SCRAPERS)))
         if not isinstance(scrapers_cfg, list):
@@ -860,18 +897,17 @@ def import_now():
         flash(f"Erreur d’import (sites) : Config sites JSON invalide: {e}")
         return redirect(url_for("admin"))
 
-    # Lance l’import en tâche de fond pour éviter un 500 timeout côté Render
-    def worker(feeds, scrapers, default_img):
+    def worker(feeds, scrapers):
         try:
-            c1, s1 = scrape_rss_once(feeds, default_image_url=default_img)
-            c2, s2 = scrape_index_once(scrapers, default_image_url=default_img)
+            c1, s1 = scrape_rss_once(feeds)
+            c2, s2 = scrape_index_once(scrapers)
             set_setting("last_import_result", f"OK : {c1+c2} nouveaux, {s1+s2} ignorés.")
         except Exception as e:
             msg = f"Erreur : {e}\n{traceback.format_exc()}"
             print("[IMPORT WORKER] fatal:", msg)
             set_setting("last_import_result", msg)
 
-    threading.Thread(target=worker, args=(feed_list, scrapers_cfg, default_image), daemon=True).start()
+    threading.Thread(target=worker, args=(feed_list, scrapers_cfg), daemon=True).start()
     flash("Import lancé en arrière-plan. Recharge l’admin dans ~1 minute pour voir le résultat.")
     return redirect(url_for("admin"))
 
@@ -896,7 +932,6 @@ def save(post_id):
         con.execute("UPDATE posts SET title=?, body=?, updated_at=? WHERE id=?",
                     (title, body, datetime.now(timezone.utc).isoformat(timespec="minutes"), post_id))
         if action == "publish":
-            # Vérifie qu'il y a bien une image avant de publier
             row = con.execute("SELECT image_url FROM posts WHERE id=?", (post_id,)).fetchone()
             if REQUIRE_IMAGE and (not row or not row["image_url"]):
                 flash("Publication refusée : une image est obligatoire.")
@@ -934,8 +969,8 @@ def alias_console():
 
 # --------- boot ---------
 init_db()
+bootstrap_openai_key()  # Clé OpenAI bootstrapée une fois depuis l'ENV vers la DB
 threading.Thread(target=publish_due_loop, daemon=True).start()
-# démarrage de l'import automatique
 threading.Thread(target=import_loop, daemon=True).start()
 
 if __name__ == "__main__":
