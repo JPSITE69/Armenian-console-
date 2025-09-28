@@ -205,12 +205,12 @@ def _title_from_text_fallback(fr_text: str) -> str:
 
 def ensure_signature(body: str) -> str:
     b = (body or "").rstrip()
-    if not b.endswith("- Arménie Info"):
-        b += "\n\n- Arménie Info"
+    if not b.endswith("- lesarmenien.com"):
+        b += "\n\n- lesarmeniens.com"
     return b
 
 def rewrite_article_fr(title_src: str, raw_text: str):
-    """Retourne (title_fr, body_fr, sure_fr). Force FR + signature Arménie Info."""
+    """Retourne (title_fr, body_fr, sure_fr). Force FR + signature lesarmeniens.com."""
     if not raw_text:
         return (title_src or "Actualité", "", False)
 
@@ -223,7 +223,7 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             "Traduis et réécris en FRANÇAIS le Titre et le Corps de l'article ci-dessous. "
             "Style neutre, informatif. 150–220 mots pour le corps. "
             "RENVOIE UNIQUEMENT du JSON avec les clés 'title' et 'body'. "
-            "Le 'body' doit être du TEXTE BRUT (pas de balises) et DOIT se terminer par: - Arménie Info.\n\n"
+            "Le 'body' doit être du TEXTE BRUT (pas de balises) et DOIT se terminer par: - lesarmeniens.com.\n\n"
             f"Titre (source): {title_src}\n"
             f"Texte (source): {clean_input}"
         )
