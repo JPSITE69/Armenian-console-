@@ -1,4 +1,8 @@
-# app.py — Console Arménienne (auto-import + auto-publish + image obligatoire + titres par contenu global + >=120 mots + clé OpenAI persistée)
+# app.py — Console Arménienne
+# Auto-import (RSS + scrapers) • Auto-publication • Photo obligatoire (avec fallback + conversion JPEG)
+# Réécriture FR (120–800 mots) • Titres régénérés à partir de tout le contenu • Nettoyage source & corps
+# Signature obligatoire : - LesArmeniens.com • Clé OpenAI saisie une fois (ENV → DB)
+
 from flask import Flask, request, redirect, url_for, Response, render_template_string, session, flash
 import sqlite3, os, hashlib, io, traceback, re, threading, time, json as _json
 from datetime import datetime, timezone
@@ -15,13 +19,13 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "change-me")
 DB_PATH    = "site.db"
 
 # Auto
-AUTO_PUBLISH = True          # Publie immédiatement tout nouvel article
-REQUIRE_IMAGE = True         # Photo obligatoire
+AUTO_PUBLISH = True                    # Publie immédiatement tout nouvel article
+REQUIRE_IMAGE = True                   # Photo obligatoire
 IMPORT_INTERVAL_MIN = int(os.environ.get("IMPORT_INTERVAL_MIN", "10"))  # boucle auto (minutes)
 
-# Cibles de longueur
-TARGET_MIN_WORDS = int(os.environ.get("TARGET_MIN_WORDS", "120"))  # minimum strict demandé
-TARGET_MAX_WORDS = int(os.environ.get("TARGET_MAX_WORDS", "420"))  # borne haute de secours (souple)
+# Longueurs cibles (mots)
+TARGET_MIN_WORDS = int(os.environ.get("TARGET_MIN_WORDS", "120"))
+TARGET_MAX_WORDS = int(os.environ.get("TARGET_MAX_WORDS", "800"))
 
 # ---- RSS par défaut
 DEFAULT_FEEDS = [
@@ -273,6 +277,75 @@ def ensure_signature(body: str) -> str:
         b += "\n\n- LesArmeniens.com"
     return b
 
+# ------- Nettoyage (source + corps) -------
+def clean_source_html(html: str) -> str:
+    """Supprime blocs parasites avant extraction: partages, related, tags, nav, footer, scripts…"""
+    try:
+        soup = BeautifulSoup(html or "", "html.parser")
+
+        # bannière / aside / nav / footer / scripts / styles
+        for tag in soup.find_all(["aside","nav","footer","form","script","style"]):
+            tag.decompose()
+
+        # classes/id parasites courants
+        junk_selectors = [
+            "[class*='share']", "[class*='sharing']", "[class*='social']",
+            "[class*='tags']", "[class*='related']", "[class*='recommend']",
+            "[class*='newsletter']", "[class*='subscribe']", "[class*='cookie']",
+            "[class*='promo']", "[class*='advert']", "[class*='banner']",
+            "[id*='share']", "[id*='social']", "[id*='related']",
+            ".td-post-author-name", ".td-post-source-tags",
+        ]
+        for sel in junk_selectors:
+            for n in soup.select(sel):
+                n.decompose()
+
+        # légendes trop verbeuses
+        for figcap in soup.find_all("figcaption"):
+            figcap.decompose()
+
+        return str(soup)
+    except Exception:
+        return html or ""
+
+CLEAN_LINES_PAT = re.compile(
+    r"""(?imx)
+    ^\s*(?:Lisez\s+aussi|Lire\s+aussi|Read\s+also|Related\s+articles?|More\s+on|Voir\s+aussi)\b.*$|
+    ^\s*(?:Photo|Crédit|Credit|Copyright)\s*:.*$|
+    ^\s*(?:Avec\s+AFP|Sources?\s*:).*$|
+    ^\s*(?:Suivez-nous|Follow\s+us|Abonnez-vous).*$|
+    ^\s*(?:©|Tous\s+droits\s+réservés).*$|
+    ^\s*Publié\s+le\s+.*$|
+    ^\s*Auteur\s*:.*$
+    """,
+    re.UNICODE,
+)
+
+def clean_body_text(body: str) -> str:
+    """Nettoie le texte final: supprime lignes inutiles, espaces multiples, doublons, assure signature."""
+    if not body:
+        return body
+    sig = "- LesArmeniens.com"
+    b = body.strip()
+    had_sig = b.endswith(sig)
+    if had_sig:
+        b = b[: -len(sig)].rstrip()
+
+    lines = [ln for ln in b.splitlines() if not CLEAN_LINES_PAT.match(ln or "")]
+    b = "\n".join(lines)
+
+    b = re.sub(r"[ \t]+", " ", b)
+    b = re.sub(r"\n{3,}", "\n\n", b).strip()
+
+    uniq = []
+    for para in b.split("\n\n"):
+        p = para.strip()
+        if not uniq or uniq[-1] != p:
+            uniq.append(p)
+    b = "\n\n".join(uniq).strip()
+    b = ensure_signature(b)
+    return b
+
 # ------- Helpers longueur >= 120 et titre basé contenu -------
 STOP_FR = set("""
 le la les un une des du de au aux en sur pour par avec dans que qui ne pas est été
@@ -287,10 +360,7 @@ def _word_count(text: str) -> int:
     return len(_tokenize_words(text))
 
 def ensure_min_words(body_text: str, source_text: str, min_words: int = TARGET_MIN_WORDS) -> str:
-    """
-    Si body_text < min_words, on complète avec du texte propre issu de source_text.
-    On respecte la signature - LesArmeniens.com (pas de doublon).
-    """
+    """Si body_text < min_words, complète à partir de la source (nettoyée), borne à TARGET_MAX_WORDS, garde signature."""
     body = (body_text or "").strip()
     sig = "- LesArmeniens.com"
     if body.endswith(sig):
@@ -306,7 +376,7 @@ def ensure_min_words(body_text: str, source_text: str, min_words: int = TARGET_M
     extra_words = _tokenize_words(extra)
     need = max(0, min_words - len(body_words))
     if need > 0 and extra_words:
-        take = min(len(extra_words), int(need * 1.2))
+        take = min(len(extra_words), int(need * 1.3))
         body = (body + " " + " ".join(extra_words[:take])).strip()
 
     if _word_count(body) > TARGET_MAX_WORDS:
@@ -323,13 +393,7 @@ def title_relevance_score(title: str, body_text: str) -> float:
     return hits / max(1, len(tw))
 
 def derive_title_from_body(body_text: str, min_words: int = 6, max_words: int = 14) -> str:
-    """
-    Titre à partir de TOUT le contenu :
-      - tokens pleins (sans stopwords),
-      - score mots = fréquence * bonus longueur,
-      - bigrammes/trigrammes scorés et assemblés,
-      - normalisation finale.
-    """
+    """Titre à partir de tout le contenu (mots forts + n-grammes), puis normalisation."""
     txt = strip_tags(body_text or "").strip()
     if not txt:
         return "Actualité"
@@ -405,7 +469,7 @@ def derive_title_from_body(body_text: str, min_words: int = 6, max_words: int = 
 # ================== RÉÉCRITURE ==================
 def rewrite_article_fr(title_src: str, raw_text: str):
     """Retourne (title_fr, body_fr, sure_fr).
-       FR + signature LesArmeniens.com + normalisation titre + >=120 mots + recalcul titre (contenu global)."""
+       FR + signature LesArmeniens.com + normalisation titre + 120–800 mots + recalcul titre (contenu global) + nettoyage."""
     if not raw_text:
         return (normalize_title(title_src or "Actualité"), "", False)
 
@@ -417,7 +481,7 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             "Tu es un journaliste francophone.\n"
             "Réécris en FRANÇAIS le TITRE et le CORPS de l'article ci-dessous, "
             "sans inventer de faits, en conservant les informations factuelles (noms, lieux, chiffres, citations importantes).\n"
-            f"Longueur du corps : au moins {TARGET_MIN_WORDS} mots (idéalement <= {TARGET_MAX_WORDS}).\n"
+            f"Longueur du corps : entre {TARGET_MIN_WORDS} et {TARGET_MAX_WORDS} mots (pas moins, pas plus que ±10%).\n"
             "Style neutre, informatif, fluide, sans listes à puces ni intertitres HTML.\n"
             "RENVOIE UNIQUEMENT du JSON avec les clés 'title' et 'body'.\n"
             "Le 'body' doit être du TEXTE BRUT (pas de balises) et DOIT se terminer par: - LesArmeniens.com.\n\n"
@@ -448,14 +512,15 @@ def rewrite_article_fr(title_src: str, raw_text: str):
         if not body_fr:
             body_fr = " ".join(clean_input.split()).strip()
 
-        # garanties longueur + signature
+        # Garanties longueur + signature + nettoyage
         body_fr = ensure_min_words(body_fr, clean_input, TARGET_MIN_WORDS)
+        body_fr = clean_body_text(body_fr)
 
-        # titre : si manquant, court ou peu pertinent -> re-généré depuis le contenu global
+        # Titre : si manquant, court ou peu pertinent -> généré depuis le contenu global
         needs_derive = (
             not title_fr
             or len(_tokenize_words(title_fr)) < 4
-            or title_relevance_score(title_fr, body_fr) < 0.25
+            or title_relevance_score(title_fr, body_fr) < 0.30
         )
         if needs_derive:
             title_fr = derive_title_from_body(body_fr)
@@ -473,19 +538,21 @@ def rewrite_article_fr(title_src: str, raw_text: str):
                 return (t2, b2, True)
             tfb = _title_from_text_fallback(b2)
             b2  = ensure_min_words(b2, clean_input, TARGET_MIN_WORDS)
-            if title_relevance_score(tfb, b2) < 0.25 or len(_tokenize_words(tfb)) < 4:
+            b2  = clean_body_text(b2)
+            if title_relevance_score(tfb, b2) < 0.30 or len(_tokenize_words(tfb)) < 4:
                 tfb = derive_title_from_body(b2)
             return (normalize_title(tfb), b2, False)
         except Exception as e:
             print(f"[AI] rewrite_article_fr failed: {e}")
 
-    # Fallback local
+    # Fallback local (sans OpenAI)
     fr_body = " ".join(strip_tags(raw_text).split())
     if _word_count(fr_body) > TARGET_MAX_WORDS:
         fr_body = " ".join(_tokenize_words(fr_body)[:TARGET_MAX_WORDS])
     fr_body = ensure_min_words(fr_body, raw_text, TARGET_MIN_WORDS)
+    fr_body = clean_body_text(fr_body)
     fr_title = _title_from_text_fallback(fr_body)
-    if title_relevance_score(fr_title, fr_body) < 0.25 or len(_tokenize_words(fr_title)) < 4:
+    if title_relevance_score(fr_title, fr_body) < 0.30 or len(_tokenize_words(fr_title)) < 4:
         fr_title = derive_title_from_body(fr_body)
     return (normalize_title(fr_title), fr_body, False)
 
@@ -648,17 +715,22 @@ def already_have_link(link: str) -> bool:
         con.close()
 
 def insert_post(title_fr, body_text, link, source, img_url):
-    # Image obligatoire ⇒ si pas d'URL trouvée, on tente l'image par défaut (si paramétrée)
+    # 1) si l'article n'a pas d'image → tente l'image par défaut
     if not img_url:
         default_img = get_setting("default_image_url", "").strip()
         if default_img:
             img_url = default_img
 
-    if REQUIRE_IMAGE and not img_url:
-        return False
-
+    # 2) download/conversion ; si ça échoue → retente encore une fois avec l'image par défaut
     local_path, sha1 = download_image(img_url) if img_url else (None, None)
+    if (not local_path or not sha1):
+        default_img = get_setting("default_image_url", "").strip()
+        if default_img and (not img_url or img_url != default_img):
+            local_path, sha1 = download_image(default_img)
+
+    # 3) exigence finale
     if REQUIRE_IMAGE and (not local_path or not sha1):
+        print("[POST] rejet: aucune image utilisable (article + défaut)")
         return False
 
     # anti-doublon image
@@ -704,6 +776,7 @@ def scrape_rss_once(feeds):
                 try:
                     link = e.get("link") or ""
                     if not link or already_have_link(link):
+                        print("[RSS] skip: link vide/doublon", link)
                         skipped += 1; continue
 
                     title_src = normalize_title((e.get("title") or "(Sans titre)").strip())
@@ -712,12 +785,15 @@ def scrape_rss_once(feeds):
                     page_html = ""
                     try:
                         page_html = http_get(link)
+                        if page_html:
+                            page_html = clean_source_html(page_html)
                     except Exception as ee:
                         print(f"[PAGE] fetch fail {link}: {ee}")
                     article_text = extract_article_text(page_html) if page_html else ""
                     if not article_text:
                         article_text = BeautifulSoup(html_from_entry(e), "html.parser").get_text(" ", strip=True)
                     if not article_text or len(article_text) < 120:
+                        print("[RSS] skip: texte trop court", link)
                         skipped += 1; continue
 
                     # image : tente la page / RSS, sinon image par défaut
@@ -727,12 +803,14 @@ def scrape_rss_once(feeds):
                         if default_img:
                             img_url = default_img
                     if REQUIRE_IMAGE and not img_url:
+                        print("[RSS] skip: pas d'image", link)
                         skipped += 1
                         continue
 
                     # FR
                     title_fr, body_text, _sure_fr = rewrite_article_fr(title_src, article_text)
                     if not body_text:
+                        print("[RSS] skip: réécriture vide", link)
                         skipped += 1; continue
 
                     if insert_post(title_fr, body_text, link, feed_title, img_url):
@@ -776,8 +854,10 @@ def scrape_index_once(scrapers_json):
             for link in links:
                 try:
                     if already_have_link(link):
+                        print("[SCRAPER] skip: doublon", link)
                         skipped += 1; continue
                     page = http_get(link)
+                    page = clean_source_html(page)
                     psoup = BeautifulSoup(page, "html.parser")
 
                     # titre
@@ -796,6 +876,7 @@ def scrape_index_once(scrapers_json):
                     if not node_text:
                         node_text = extract_article_text(page)
                     if not node_text or len(node_text) < 120:
+                        print("[SCRAPER] skip: texte trop court", link)
                         skipped += 1; continue
 
                     # image : page / meta / fallback par défaut
@@ -812,12 +893,14 @@ def scrape_index_once(scrapers_json):
                         if default_img:
                             img = default_img
                     if REQUIRE_IMAGE and not img:
+                        print("[SCRAPER] skip: pas d'image", link)
                         skipped += 1
                         continue
 
                     # FR
                     title_fr, body_text, _sure = rewrite_article_fr(title_src, node_text)
                     if not body_text:
+                        print("[SCRAPER] skip: réécriture vide", link)
                         skipped += 1; continue
 
                     if insert_post(title_fr, body_text, link, name, img):
@@ -830,6 +913,27 @@ def scrape_index_once(scrapers_json):
         except Exception as e:
             print("[SCRAPER] config error:", e)
     return created, skipped
+
+# -------- utilitaire import (1 fois) --------
+def run_import_once():
+    """Import RSS + scrapers une seule fois, renvoie (created, skipped, detail_msg)."""
+    feeds_txt = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
+    feed_list = [u.strip() for u in feeds_txt.splitlines() if u.strip()]
+    try:
+        scrapers_cfg = _json.loads(get_setting("scrapers_json", _json.dumps(DEFAULT_SCRAPERS)))
+        if not isinstance(scrapers_cfg, list):
+            raise ValueError("Le JSON de scrapers doit être une liste []")
+    except Exception as e:
+        msg = f"Config sites JSON invalide: {e}"
+        set_setting("last_import_result", msg)
+        return 0, 0, msg
+
+    c1, s1 = scrape_rss_once(feed_list)
+    c2, s2 = scrape_index_once(scrapers_cfg)
+    total_c, total_s = (c1 + c2), (s1 + s2)
+    msg = f"Import OK: {total_c} créés, {total_s} ignorés (RSS {c1}/{s1}, Sites {c2}/{s2})"
+    set_setting("last_import_result", msg)
+    return total_c, total_s, msg
 
 # ================== SCHEDULER (publication auto) ==================
 def publish_due_loop():
@@ -859,22 +963,8 @@ def publish_due_loop():
 def import_loop():
     while True:
         try:
-            print("[IMPORT LOOP] démarrage cycle...")
-            # RSS
-            feeds_txt = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
-            feed_list = [u.strip() for u in feeds_txt.splitlines() if u.strip()]
-            # Scrapers
-            try:
-                scrapers_cfg = _json.loads(get_setting("scrapers_json", _json.dumps(DEFAULT_SCRAPERS)))
-                if not isinstance(scrapers_cfg, list):
-                    raise ValueError("Le JSON de scrapers doit être une liste []")
-            except Exception as e:
-                print(f"[IMPORT LOOP] Config sites JSON invalide: {e}")
-                scrapers_cfg = []
-            c1, s1 = scrape_rss_once(feed_list)
-            c2, s2 = scrape_index_once(scrapers_cfg)
-            set_setting("last_import_result", f"OK (auto): {c1+c2} nouveaux, {s1+s2} ignorés.")
-            print(f"[IMPORT LOOP] terminé: {c1+c2} nouveaux, {s1+s2} ignorés.")
+            print("[IMPORT LOOP] cycle…")
+            run_import_once()
         except Exception as e:
             msg = f"Erreur (auto import): {e}\n{traceback.format_exc()}"
             print("[IMPORT LOOP] fatal:", msg)
@@ -1030,7 +1120,7 @@ def admin():
       <form method="post" action="{url_for('import_now')}" style="margin-top:1rem">
         <button type="submit">🔁 Importer maintenant (RSS + Scraping)</button>
       </form>
-      <p><small>Import automatique toutes les {IMPORT_INTERVAL_MIN} min.</small></p>
+      <p><small>Import automatique toutes les {IMPORT_INTERVAL_MIN} min. • Cron HTTP: <code>{request.url_root}cron/import</code></small></p>
     </article>
 
     <h4>Brouillons</h4>{''.join(card(r) for r in drafts) or "<p>Aucun brouillon.</p>"}
@@ -1059,29 +1149,15 @@ def save_settings():
 @app.post("/import-now")
 def import_now():
     if not session.get("ok"): return redirect(url_for("admin"))
-
-    feeds_txt = get_setting("feeds", "\n".join(DEFAULT_FEEDS))
-    feed_list = [u.strip() for u in feeds_txt.splitlines() if u.strip()]
-
-    try:
-        scrapers_cfg = _json.loads(get_setting("scrapers_json", _json.dumps(DEFAULT_SCRAPERS)))
-        if not isinstance(scrapers_cfg, list):
-            raise ValueError("Le JSON de scrapers doit être une liste []")
-    except Exception as e:
-        flash(f"Erreur d’import (sites) : Config sites JSON invalide: {e}")
-        return redirect(url_for("admin"))
-
-    def worker(feeds, scrapers):
+    def worker():
         try:
-            c1, s1 = scrape_rss_once(feeds)
-            c2, s2 = scrape_index_once(scrapers)
-            set_setting("last_import_result", f"OK : {c1+c2} nouveaux, {s1+s2} ignorés.")
+            c, s, msg = run_import_once()
+            print("[MANUAL IMPORT]", msg)
         except Exception as e:
             msg = f"Erreur : {e}\n{traceback.format_exc()}"
             print("[IMPORT WORKER] fatal:", msg)
             set_setting("last_import_result", msg)
-
-    threading.Thread(target=worker, args=(feed_list, scrapers_cfg), daemon=True).start()
+    threading.Thread(target=worker, daemon=True).start()
     flash("Import lancé en arrière-plan. Recharge l’admin dans ~1 minute pour voir le résultat.")
     return redirect(url_for("admin"))
 
@@ -1089,6 +1165,11 @@ def import_now():
 def import_now_get():
     flash("Utilise le bouton « Importer maintenant » dans l’admin.")
     return redirect(url_for("admin"))
+
+@app.get("/cron/import")
+def cron_import():
+    c, s, msg = run_import_once()
+    return f"{msg}\n", 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 @app.post("/save/<int:post_id>")
 def save(post_id):
@@ -1099,7 +1180,12 @@ def save(post_id):
     publish_at = request.form.get("publish_at","").strip()
 
     if body:
+        # garantit [TARGET_MIN_WORDS, TARGET_MAX_WORDS] + signature + nettoyage
+        body = " ".join(_tokenize_words(body))
+        if _word_count(body) > TARGET_MAX_WORDS:
+            body = " ".join(_tokenize_words(body)[:TARGET_MAX_WORDS])
         body = ensure_min_words(body, body, TARGET_MIN_WORDS)
+        body = clean_body_text(body)
 
     con = db()
     try:
@@ -1143,9 +1229,16 @@ def alias_console():
 
 # --------- boot ---------
 init_db()
-bootstrap_openai_key()  # Clé OpenAI bootstrapée une fois depuis l'ENV vers la DB
+bootstrap_openai_key()
+# Import immédiat au démarrage (utile si l'hébergeur coupe les threads)
+try:
+    run_import_once()
+except Exception as e:
+    print("[BOOT] import initial failed:", e)
+
 threading.Thread(target=publish_due_loop, daemon=True).start()
 threading.Thread(target=import_loop, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
