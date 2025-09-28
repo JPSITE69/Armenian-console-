@@ -1,4 +1,4 @@
-# app.py — Console Arménienne (auto-import + auto-publish + image obligatoire + titres propres + >=120 mots + clé OpenAI persistée)
+# app.py — Console Arménienne (auto-import + auto-publish + image obligatoire + titres par contenu global + >=120 mots + clé OpenAI persistée)
 from flask import Flask, request, redirect, url_for, Response, render_template_string, session, flash
 import sqlite3, os, hashlib, io, traceback, re, threading, time, json as _json
 from datetime import datetime, timezone
@@ -299,32 +299,22 @@ def ensure_min_words(body_text: str, source_text: str, min_words: int = TARGET_M
     if _word_count(body) >= min_words:
         return ensure_signature(body)
 
-    # Complément depuis la source
     src_clean = strip_tags(source_text or "")
-    # évite de re-coller du déjà présent
-    extra = " ".join([w for w in src_clean.split() if w not in set(body.split())])
-    if not extra:
-        extra = src_clean
+    extra = " ".join([w for w in src_clean.split() if w not in set(body.split())]) or src_clean
 
-    # on complète jusqu'à min_words sans dépasser de beaucoup
     body_words = _tokenize_words(body)
     extra_words = _tokenize_words(extra)
     need = max(0, min_words - len(body_words))
     if need > 0 and extra_words:
-        # on ajoute ~10% de marge douce
         take = min(len(extra_words), int(need * 1.2))
         body = (body + " " + " ".join(extra_words[:take])).strip()
 
-    # borne haute de sécurité
     if _word_count(body) > TARGET_MAX_WORDS:
         body = " ".join(_tokenize_words(body)[:TARGET_MAX_WORDS])
 
     return ensure_signature(body)
 
 def title_relevance_score(title: str, body_text: str) -> float:
-    """
-    Score très simple : proportion de mots significatifs du titre qui apparaissent dans le corps.
-    """
     tw = [w for w in _tokenize_words(title) if w not in STOP_FR]
     if not tw:
         return 0.0
@@ -332,29 +322,90 @@ def title_relevance_score(title: str, body_text: str) -> float:
     hits = sum(1 for w in tw if w in bw)
     return hits / max(1, len(tw))
 
-def derive_title_from_body(body_text: str, min_len: int = 6, max_len: int = 14) -> str:
+def derive_title_from_body(body_text: str, min_words: int = 6, max_words: int = 14) -> str:
     """
-    Fallback de titre basé contenu : top mots (hors stopwords), recollés en 6–14 mots lisibles,
-    puis normalisés. Basique mais robuste si l’IA titre mal.
+    Titre à partir de TOUT le contenu :
+      - tokens pleins (sans stopwords),
+      - score mots = fréquence * bonus longueur,
+      - bigrammes/trigrammes scorés et assemblés,
+      - normalisation finale.
     """
-    words = [w for w in _tokenize_words(body_text) if w not in STOP_FR]
-    if not words:
+    txt = strip_tags(body_text or "").strip()
+    if not txt:
         return "Actualité"
-    # fréquences
+
+    tokens = [w for w in _tokenize_words(txt) if w not in STOP_FR and len(w) > 2]
+    if not tokens:
+        return normalize_title(_title_from_text_fallback(txt))
+
     freq = {}
-    for w in words:
+    for w in tokens:
         freq[w] = freq.get(w, 0) + 1
-    ranked = sorted(freq.items(), key=lambda kv: (kv[1], len(kv[0])), reverse=True)
-    top = [w for (w, c) in ranked[:max_len]]
-    if len(top) < min_len:
-        top = (top + words[:min_len])[:min_len]
-    raw = " ".join(top[:max_len])
-    return normalize_title(raw)
+    w_weight = {w: freq[w] * (1.0 + min(len(w), 14) / 6.0) for w in freq}
+
+    def ngrams(words, n):
+        return [" ".join(words[i:i+n]) for i in range(len(words)-n+1)]
+    bigrams  = ngrams(tokens, 2)
+    trigrams = ngrams(tokens, 3)
+
+    def score_ngram(ng):
+        parts = ng.split()
+        uniq = set(parts)
+        base = sum(w_weight.get(p, 0.0) for p in parts)
+        rep_penalty = (len(parts) / len(uniq)) if len(uniq) else 2.0
+        return base / rep_penalty
+
+    cand_tri = {}
+    for g in trigrams:
+        cand_tri[g] = cand_tri.get(g, 0.0) + score_ngram(g)
+    cand_bi = {}
+    for g in bigrams:
+        cand_bi[g] = cand_bi.get(g, 0.0) + score_ngram(g)
+
+    top_tri = sorted(cand_tri.items(), key=lambda kv: kv[1], reverse=True)[:12]
+    top_bi  = sorted(cand_bi.items(),  key=lambda kv: kv[1], reverse=True)[:12]
+
+    chosen = []
+    used_words = set()
+
+    def push_phrase(phrase):
+        nonlocal chosen, used_words
+        for w in phrase.split():
+            if w not in used_words:
+                chosen.append(w)
+                used_words.add(w)
+
+    if top_tri:
+        push_phrase(top_tri[0][0])
+    elif top_bi:
+        push_phrase(top_bi[0][0])
+    else:
+        for w, _ in sorted(w_weight.items(), key=lambda kv: kv[1], reverse=True)[:max_words]:
+            push_phrase(w)
+
+    if len(chosen) < min_words and top_bi:
+        for phrase, _sc in top_bi:
+            if len(chosen) >= max_words:
+                break
+            p_words = phrase.split()
+            overlap = sum(1 for w in p_words if w in used_words)
+            if overlap <= len(p_words) // 2:
+                push_phrase(phrase)
+
+    if len(chosen) < min_words:
+        for w, _ in sorted(w_weight.items(), key=lambda kv: kv[1], reverse=True):
+            if len(chosen) >= min(min_words, max_words):
+                break
+            if w not in used_words:
+                push_phrase(w)
+
+    headline = " ".join(chosen[:max_words])
+    return normalize_title(headline)
 
 # ================== RÉÉCRITURE ==================
 def rewrite_article_fr(title_src: str, raw_text: str):
     """Retourne (title_fr, body_fr, sure_fr).
-       Force FR + signature LesArmeniens.com + normalisation titre + >=120 mots + recalcul titre si peu pertinent."""
+       FR + signature LesArmeniens.com + normalisation titre + >=120 mots + recalcul titre (contenu global)."""
     if not raw_text:
         return (normalize_title(title_src or "Actualité"), "", False)
 
@@ -396,13 +447,19 @@ def rewrite_article_fr(title_src: str, raw_text: str):
             body_fr  = strip_tags(parts[1] if len(parts) > 1 else "").strip()
         if not body_fr:
             body_fr = " ".join(clean_input.split()).strip()
-        # garanties
+
+        # garanties longueur + signature
         body_fr = ensure_min_words(body_fr, clean_input, TARGET_MIN_WORDS)
-        if not title_fr:
-            title_fr = _title_from_text_fallback(body_fr)
-        # si le titre colle mal au contenu, on le régénère
-        if title_relevance_score(title_fr, body_fr) < 0.35 or len(_tokenize_words(title_fr)) < 4:
+
+        # titre : si manquant, court ou peu pertinent -> re-généré depuis le contenu global
+        needs_derive = (
+            not title_fr
+            or len(_tokenize_words(title_fr)) < 4
+            or title_relevance_score(title_fr, body_fr) < 0.25
+        )
+        if needs_derive:
             title_fr = derive_title_from_body(body_fr)
+
         title_fr = normalize_title(title_fr)
         return title_fr, body_fr
 
@@ -416,7 +473,7 @@ def rewrite_article_fr(title_src: str, raw_text: str):
                 return (t2, b2, True)
             tfb = _title_from_text_fallback(b2)
             b2  = ensure_min_words(b2, clean_input, TARGET_MIN_WORDS)
-            if title_relevance_score(tfb, b2) < 0.35 or len(_tokenize_words(tfb)) < 4:
+            if title_relevance_score(tfb, b2) < 0.25 or len(_tokenize_words(tfb)) < 4:
                 tfb = derive_title_from_body(b2)
             return (normalize_title(tfb), b2, False)
         except Exception as e:
@@ -424,12 +481,11 @@ def rewrite_article_fr(title_src: str, raw_text: str):
 
     # Fallback local
     fr_body = " ".join(strip_tags(raw_text).split())
-    # borne haute de sécurité
     if _word_count(fr_body) > TARGET_MAX_WORDS:
         fr_body = " ".join(_tokenize_words(fr_body)[:TARGET_MAX_WORDS])
     fr_body = ensure_min_words(fr_body, raw_text, TARGET_MIN_WORDS)
     fr_title = _title_from_text_fallback(fr_body)
-    if title_relevance_score(fr_title, fr_body) < 0.35 or len(_tokenize_words(fr_title)) < 4:
+    if title_relevance_score(fr_title, fr_body) < 0.25 or len(_tokenize_words(fr_title)) < 4:
         fr_title = derive_title_from_body(fr_body)
     return (normalize_title(fr_title), fr_body, False)
 
@@ -525,23 +581,30 @@ def get_image_from_entry(entry, page_html=None, page_url=None):
     return None
 
 def download_image(url):
-    if not url: return None, None
+    if not url:
+        return None, None
     try:
         r = requests.get(url, timeout=20)
         r.raise_for_status()
         data = r.content
-        sha1 = hashlib.sha1(data).hexdigest()
+
         try:
             im = Image.open(io.BytesIO(data))
-            im.verify()
-        except (UnidentifiedImageError, Exception) as e:
-            print(f"[IMG] verify fail {url}: {e}")
+            im.load()
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+
+            os.makedirs("static/images", exist_ok=True)
+            sha1 = hashlib.sha1(data).hexdigest()
+            path = f"static/images/{sha1}.jpg"
+            if not os.path.exists(path):
+                im.save(path, format="JPEG", quality=88, optimize=True)
+
+            return "/" + path, sha1
+        except Exception as e:
+            print(f"[IMG] convert/save fail {url}: {e}")
             return None, None
-        os.makedirs("static/images", exist_ok=True)
-        path = f"static/images/{sha1}.jpg"
-        if not os.path.exists(path):
-            with open(path, "wb") as f: f.write(data)
-        return "/"+path, sha1
+
     except Exception as e:
         print(f"[IMG] download failed for {url}: {e}")
         return None, None
@@ -585,9 +648,15 @@ def already_have_link(link: str) -> bool:
         con.close()
 
 def insert_post(title_fr, body_text, link, source, img_url):
-    # Image obligatoire
+    # Image obligatoire ⇒ si pas d'URL trouvée, on tente l'image par défaut (si paramétrée)
+    if not img_url:
+        default_img = get_setting("default_image_url", "").strip()
+        if default_img:
+            img_url = default_img
+
     if REQUIRE_IMAGE and not img_url:
         return False
+
     local_path, sha1 = download_image(img_url) if img_url else (None, None)
     if REQUIRE_IMAGE and (not local_path or not sha1):
         return False
@@ -651,8 +720,12 @@ def scrape_rss_once(feeds):
                     if not article_text or len(article_text) < 120:
                         skipped += 1; continue
 
-                    # image (photo obligatoire)
+                    # image : tente la page / RSS, sinon image par défaut
                     img_url = get_image_from_entry(e, page_html=page_html, page_url=link)
+                    if not img_url:
+                        default_img = get_setting("default_image_url", "").strip()
+                        if default_img:
+                            img_url = default_img
                     if REQUIRE_IMAGE and not img_url:
                         skipped += 1
                         continue
@@ -725,7 +798,7 @@ def scrape_index_once(scrapers_json):
                     if not node_text or len(node_text) < 120:
                         skipped += 1; continue
 
-                    # image (photo obligatoire)
+                    # image : page / meta / fallback par défaut
                     img = None
                     for isel in cfg.get("image_selectors", []):
                         val = soup_select_attr(psoup, isel)
@@ -734,6 +807,10 @@ def scrape_index_once(scrapers_json):
                             break
                     if not img:
                         img = find_main_image_in_html(page, base_url=link)
+                    if not img:
+                        default_img = get_setting("default_image_url", "").strip()
+                        if default_img:
+                            img = default_img
                     if REQUIRE_IMAGE and not img:
                         skipped += 1
                         continue
@@ -994,4 +1071,81 @@ def import_now():
         flash(f"Erreur d’import (sites) : Config sites JSON invalide: {e}")
         return redirect(url_for("admin"))
 
-    def worker(feeds, scr
+    def worker(feeds, scrapers):
+        try:
+            c1, s1 = scrape_rss_once(feeds)
+            c2, s2 = scrape_index_once(scrapers)
+            set_setting("last_import_result", f"OK : {c1+c2} nouveaux, {s1+s2} ignorés.")
+        except Exception as e:
+            msg = f"Erreur : {e}\n{traceback.format_exc()}"
+            print("[IMPORT WORKER] fatal:", msg)
+            set_setting("last_import_result", msg)
+
+    threading.Thread(target=worker, args=(feed_list, scrapers_cfg), daemon=True).start()
+    flash("Import lancé en arrière-plan. Recharge l’admin dans ~1 minute pour voir le résultat.")
+    return redirect(url_for("admin"))
+
+@app.get("/import-now")
+def import_now_get():
+    flash("Utilise le bouton « Importer maintenant » dans l’admin.")
+    return redirect(url_for("admin"))
+
+@app.post("/save/<int:post_id>")
+def save(post_id):
+    if not session.get("ok"): return redirect(url_for("admin"))
+    action     = request.form.get("action","save")
+    title      = strip_tags(request.form.get("title","").strip())
+    body       = strip_tags(request.form.get("body","").strip())
+    publish_at = request.form.get("publish_at","").strip()
+
+    if body:
+        body = ensure_min_words(body, body, TARGET_MIN_WORDS)
+
+    con = db()
+    try:
+        con.execute("UPDATE posts SET title=?, body=?, updated_at=? WHERE id=?",
+                    (normalize_title(title), body, datetime.now(timezone.utc).isoformat(timespec="minutes"), post_id))
+        if action == "publish":
+            row = con.execute("SELECT image_url FROM posts WHERE id=?", (post_id,)).fetchone()
+            if REQUIRE_IMAGE and (not row or not row["image_url"]):
+                flash("Publication refusée : une image est obligatoire.")
+            else:
+                con.execute("UPDATE posts SET status='published', publish_at=NULL WHERE id=?", (post_id,))
+                flash("Publié immédiatement.")
+        elif action == "unpublish":
+            con.execute("UPDATE posts SET status='draft', publish_at=NULL WHERE id=?", (post_id,))
+            flash("Dépublié.")
+        elif action == "schedule":
+            if not publish_at:
+                flash("Choisis une date/heure (UTC) pour planifier.")
+            else:
+                iso_utc = publish_at if len(publish_at) == 16 else publish_at[:16]
+                iso_utc += ":00+00:00" if len(iso_utc) == 16 else ""
+                con.execute("UPDATE posts SET status='scheduled', publish_at=? WHERE id=?", (iso_utc, post_id))
+                flash(f"Planifié pour {iso_utc} (UTC).")
+        elif action == "delete":
+            con.execute("DELETE FROM posts WHERE id=?", (post_id,))
+            flash("Supprimé.")
+        else:
+            flash("Enregistré.")
+        con.commit()
+    finally:
+        con.close()
+    return redirect(url_for("admin"))
+
+@app.get("/logout")
+def logout():
+    session.clear(); return redirect(url_for("home"))
+
+@app.get("/console")
+def alias_console():
+    return redirect(url_for("admin"))
+
+# --------- boot ---------
+init_db()
+bootstrap_openai_key()  # Clé OpenAI bootstrapée une fois depuis l'ENV vers la DB
+threading.Thread(target=publish_due_loop, daemon=True).start()
+threading.Thread(target=import_loop, daemon=True).start()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
